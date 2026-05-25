@@ -110,6 +110,8 @@
 
 | 服务端请求参数校验与数据清洗规范-详细设计.md | 四层校验架构(清洗→格式→域校验→业务规则)、Pydantic V2 Annotated自定义类型(PhoneCn/GradeCode/SubjectCode等)、通用清洗函数(trim/HTML转义/路径防护)、跨字段规则Mixin、RFC 7807校验错误响应、敏感值脱敏、批量请求部分失败模式、校验器注册表、注入防护矩阵 | ✅ 已完成 |
 
+| 客户端应用包体积优化与资源管理策略-详细设计.md | 包体积预算分配、Flutter构建优化(split-per-abi/tree-shake/deferred-components)、图片资源优化管线(WebP/Lottie)、字体子集化、资源包分层架构(5层)、按需下载策略、CI/CD体积门禁、分学段资源差异化、存储配额管理(LRU淘汰)、降级策略、监控指标、新模块接入检查清单 | ✅ 已完成 |
+
 ## 约定
 
 - 编码：UTF-8
