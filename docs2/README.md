@@ -112,6 +112,8 @@
 
 | 客户端应用包体积优化与资源管理策略-详细设计.md | 包体积预算分配、Flutter构建优化(split-per-abi/tree-shake/deferred-components)、图片资源优化管线(WebP/Lottie)、字体子集化、资源包分层架构(5层)、按需下载策略、CI/CD体积门禁、分学段资源差异化、存储配额管理(LRU淘汰)、降级策略、监控指标、新模块接入检查清单 | ✅ 已完成 |
 
+| 客户端通用列表组件与分页加载引擎-详细设计.md | PagedListWidget组件、PagedListController状态机、Cursor/Offset双分页模式、分组列表、网格列表、搜索集成、管理后台表格、乐观更新、离线操作队列、服务端Cursor生成规范、Riverpod集成、跨模块清单、性能优化、测试策略 | ✅ 已完成 |
+
 ## 约定
 
 - 编码：UTF-8
