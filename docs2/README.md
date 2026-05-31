@@ -113,6 +113,7 @@
 
 | 服务端数据库事务管理与并发控制策略-详细设计.md | 事务隔离级别、乐观锁、悲观锁、分布式锁、死锁预防、Outbox消息表、并发测试工具 | ✅ 已完成 |
 | 客户端Flutter平台通道与原生能力桥接层-详细设计.md | NativeCapability统一抽象层、NativeResult结果封装、能力注册表、7大原生能力(相机拍照/音频录制/音频播放/生物识别/本地通知/设备信息/屏幕控制)、Android Kotlin+iOS Swift双端实现、Riverpod Provider集成、Mock测试框架、降级策略矩阵、跨模块依赖关系、通道命名规范、新增能力接入清单 | ✅ 已完成 |
+| 服务端-用户额度管控与功能门控引擎-详细设计.md | 额度类型枚举(10种)、Redis Lua原子扣减脚本、QuotaService(检查/扣减/退还/查询)、FeatureGateService(灰度/学段/会员等级/年龄门控)、FastAPI装饰器集成、默认额度矩阵(4等级×10额度)、超限策略(block/degrade/pay)、会员等级变更缓存失效、额度包生命周期、DB降级路径、Redis-MySQL对账任务、监控指标、Flutter客户端Provider+拦截器、跨模块集成清单、容量估算 | ✅ 已完成 |
 
 | 服务端请求参数校验与数据清洗规范-详细设计.md | 四层校验架构(清洗→格式→域校验→业务规则)、Pydantic V2 Annotated自定义类型(PhoneCn/GradeCode/SubjectCode等)、通用清洗函数(trim/HTML转义/路径防护)、跨字段规则Mixin、RFC 7807校验错误响应、敏感值脱敏、批量请求部分失败模式、校验器注册表、注入防护矩阵 | ✅ 已完成 |
 
