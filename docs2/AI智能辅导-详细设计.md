@@ -1,1278 +1,1468 @@
-# AI 智能辅导 - 详细设计文档
+# AI智能辅导模块详细设计
 
 ## 1. 模块概述
 
-AI 智能辅导是 PrimeTop 的核心引擎，为学生提供随时可用的 AI 学习助手。支持文字、语音、图片多模态输入，根据用户学段、年级、学科、教材版本和学习进度，输出符合认知水平的讲解内容。
+### 1.1 功能定位
+AI智能辅导模块是PrimeTop的核心功能，为学生提供随时可用的AI学习助手，支持文字、语音、图片等多模态输入，根据用户年级、学科、教材版本和学习进度，输出符合认知水平的讲解内容。
 
-### 1.1 功能范围
+### 1.2 核心能力
+- 自然语言提问与多轮对话
+- 分学段、分年级的适龄化讲解
+- 分步提示与启发式引导
+- 知识点关联与溯源引用
+- 追问拓展与深度学习
+- 内容安全过滤与合规控制
 
-| 功能 | 优先级 | MVP |
-|------|--------|-----|
-| 文字问答 | P0 | ✅ |
-| 多轮连续追问 | P0 | ✅ |
-| 分学段讲解（适龄化输出） | P0 | ✅ |
-| 分步提示（先思路后答案） | P0 | ✅ |
-| 知识点关联（映射教材章节） | P0 | ✅ |
-| 语音提问 | P1 | ❌ |
-| 图片输入（非拍题场景） | P1 | ❌ |
-| 追问快捷操作（再讲简单点、生成同类题等） | P1 | ❌ |
-| 安全过滤 | P0 | ✅ |
-
----
-
-## 2. 核心概念与数据结构
-
-### 2.1 对话会话表 `ai_conversations`
-
-```sql
-CREATE TABLE ai_conversations (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '会话ID',
-    user_id         BIGINT NOT NULL COMMENT '用户ID',
-    title           VARCHAR(100) COMMENT '会话标题（取首条消息摘要）',
-    subject         VARCHAR(20) COMMENT '学科: chinese/math/english/physics/chemistry/biology/history/geography/politics',
-    stage           VARCHAR(20) NOT NULL COMMENT '学段（快照）',
-    grade           INT NOT NULL COMMENT '年级（快照）',
-    textbook_edition VARCHAR(50) COMMENT '教材版本（快照）',
-    status          TINYINT NOT NULL DEFAULT 1 COMMENT '状态: 0=已删除, 1=活跃, 2=已归档',
-    message_count   INT NOT NULL DEFAULT 0 COMMENT '消息计数',
-    last_message_at DATETIME COMMENT '最后消息时间',
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    INDEX idx_user_status (user_id, status),
-    INDEX idx_last_msg (user_id, last_message_at DESC)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI对话会话';
+### 1.3 技术架构
+```
+客户端层
+    ├─ 文字输入
+    ├─ 语音输入 (ASR)
+    └─ 图片输入
+        │
+API网关层
+    ├─ 鉴权校验
+    ├─ 限流控制
+    └─ 日志记录
+        │
+业务服务层
+    ├─ 对话上下文管理
+    ├─ 用户画像获取
+    ├─ 学段年级适配
+    └─ 知识点映射
+        │
+AI能力编排层
+    ├─ Prompt模板引擎
+    ├─ RAG检索增强
+    ├─ 多模型调度
+    └─ 输出后处理
+        │
+外部服务层
+    ├─ 大模型API (多供应商)
+    ├─ 向量检索
+    ├─ 内容审核
+    └─ 语音合成 (TTS)
 ```
 
-### 2.2 对话消息表 `ai_messages`
+## 2. 数据结构定义
+
+### 2.1 核心数据表
+
+#### 2.1.1 会话表 (ai_conversation)
+
+| 字段名 | 类型 | 说明 | 约束 |
+|--------|------|------|------|
+| id | BIGINT | 主键ID | PK, AUTO_INCREMENT |
+| user_id | BIGINT | 用户ID | NOT NULL, FK |
+| session_id | VARCHAR(64) | 会话唯一标识 | NOT NULL, UNIQUE |
+| title | VARCHAR(200) | 会话标题 | |
+| subject_id | INT | 学科ID | FK |
+| grade_level | VARCHAR(20) | 年级（如：小学一年级） | |
+| textbook_id | INT | 教材版本ID | FK |
+| model_id | VARCHAR(50) | 使用的大模型ID | |
+| total_messages | INT | 消息总数 | DEFAULT 0 |
+| total_tokens | INT | 总Token消耗 | DEFAULT 0 |
+| status | TINYINT | 状态：1-进行中，2-已结束，3-已归档 | DEFAULT 1 |
+| created_at | TIMESTAMP | 创建时间 | DEFAULT CURRENT_TIMESTAMP |
+| updated_at | TIMESTAMP | 更新时间 | DEFAULT CURRENT_TIMESTAMP ON UPDATE |
+| ended_at | TIMESTAMP | 结束时间 | |
+| deleted_at | TIMESTAMP | 删除时间 | |
 
 ```sql
-CREATE TABLE ai_messages (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '消息ID',
-    conversation_id BIGINT NOT NULL COMMENT '会话ID',
-    user_id         BIGINT NOT NULL COMMENT '用户ID',
-    role            VARCHAR(20) NOT NULL COMMENT '角色: user/assistant/system',
-    content_type    VARCHAR(20) NOT NULL DEFAULT 'text' COMMENT '内容类型: text/image/voice/formula',
-    content         TEXT NOT NULL COMMENT '消息正文（Markdown格式）',
-    -- 结构化回答字段（assistant消息专用）
-    thinking        TEXT COMMENT 'AI思考过程（可选展示）',
-    answer_summary  VARCHAR(500) COMMENT '一句话总结',
-    key_points      JSON COMMENT '关键知识点 ["二元一次方程","代入消元法"]',
-    related_kp_ids  JSON COMMENT '关联知识点ID [1001,1002]',
-    related_chapter VARCHAR(200) COMMENT '关联教材章节 "人教版七年级上册第三章"',
-    step_count      INT COMMENT '解题步骤数（理科题）',
-    -- 元数据
-    model_name      VARCHAR(50) COMMENT '使用的模型: glm-5/gpt-4o/deepseek-r1',
-    prompt_version  VARCHAR(20) COMMENT 'Prompt模板版本',
-    input_tokens    INT COMMENT '输入token数',
-    output_tokens   INT COMMENT '输出token数',
-    latency_ms      INT COMMENT '响应耗时(ms)',
-    -- 用户反馈
-    user_rating     TINYINT COMMENT '用户评分: 1=踩, 2=踩后纠错, null=未评, 3=有用, 4=非常好',
-    feedback_tag    VARCHAR(50) COMMENT '反馈标签: wrong_answer/too_complex/off_topic/good',
-    feedback_text   VARCHAR(500) COMMENT '反馈文字',
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_conv_id (conversation_id, created_at),
-    INDEX idx_user_created (user_id, created_at DESC),
-    INDEX idx_model_latency (model_name, latency_ms)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI对话消息';
+CREATE TABLE ai_conversation (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    user_id BIGINT NOT NULL,
+    session_id VARCHAR(64) NOT NULL UNIQUE,
+    title VARCHAR(200),
+    subject_id INT,
+    grade_level VARCHAR(20),
+    textbook_id INT,
+    model_id VARCHAR(50),
+    total_messages INT DEFAULT 0,
+    total_tokens INT DEFAULT 0,
+    status TINYINT DEFAULT 1 COMMENT '1-进行中，2-已结束，3-已归档',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP NULL,
+    deleted_at TIMESTAMP NULL,
+    INDEX idx_user_id (user_id),
+    INDEX idx_status (status),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI对话会话表';
 ```
 
-### 2.3 消息附件表 `ai_message_attachments`
+#### 2.1.2 消息表 (ai_message)
+
+| 字段名 | 类型 | 说明 | 约束 |
+|--------|------|------|------|
+| id | BIGINT | 主键ID | PK, AUTO_INCREMENT |
+| conversation_id | BIGINT | 会话ID | NOT NULL, FK |
+| session_id | VARCHAR(64) | 会话标识 | NOT NULL |
+| role | TINYINT | 角色：1-用户，2-助手，3-系统 | NOT NULL |
+| content_type | TINYINT | 内容类型：1-文本，2-语音，3-图片，4-混合 | DEFAULT 1 |
+| text_content | TEXT | 文本内容 | MEDIUMTEXT |
+| audio_url | VARCHAR(500) | 语音URL | |
+| image_urls | JSON | 图片URL列表 | |
+| input_tokens | INT | 输入Token数 | |
+| output_tokens | INT | 输出Token数 | |
+| model_id | VARCHAR(50) | 使用的模型ID | |
+| knowledge_points | JSON | 关联的知识点ID列表 | |
+| rag_sources | JSON | RAG检索的来源信息 | |
+| safety_check_result | JSON | 安全审核结果 | |
+| feedback_score | TINYINT | 用户反馈评分：1-5分 | |
+| feedback_tags | JSON | 反馈标签 | |
+| created_at | TIMESTAMP | 创建时间 | DEFAULT CURRENT_TIMESTAMP |
+| is_deleted | BOOLEAN | 是否删除 | DEFAULT FALSE |
 
 ```sql
-CREATE TABLE ai_message_attachments (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
-    message_id      BIGINT NOT NULL COMMENT '消息ID',
-    file_type       VARCHAR(20) NOT NULL COMMENT '类型: image/voice/formula_image',
-    file_url        VARCHAR(500) NOT NULL COMMENT '文件URL',
-    file_size       INT COMMENT '文件大小(bytes)',
-    width           INT COMMENT '图片宽度',
-    height          INT COMMENT '图片高度',
-    duration_sec    INT COMMENT '语音时长(秒)',
-    ocr_text        TEXT COMMENT 'OCR识别文本（图片类型）',
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_message (message_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='消息附件';
+CREATE TABLE ai_message (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    conversation_id BIGINT NOT NULL,
+    session_id VARCHAR(64) NOT NULL,
+    role TINYINT NOT NULL COMMENT '1-用户，2-助手，3-系统',
+    content_type TINYINT DEFAULT 1 COMMENT '1-文本，2-语音，3-图片，4-混合',
+    text_content MEDIUMTEXT,
+    audio_url VARCHAR(500),
+    image_urls JSON,
+    input_tokens INT,
+    output_tokens INT,
+    model_id VARCHAR(50),
+    knowledge_points JSON COMMENT '关联的知识点ID列表',
+    rag_sources JSON COMMENT 'RAG检索的来源信息',
+    safety_check_result JSON COMMENT '安全审核结果',
+    feedback_score TINYINT COMMENT '用户反馈评分：1-5分',
+    feedback_tags JSON COMMENT '反馈标签',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    is_deleted BOOLEAN DEFAULT FALSE,
+    INDEX idx_conversation_id (conversation_id),
+    INDEX idx_session_id (session_id),
+    INDEX idx_created_at (created_at),
+    FOREIGN KEY (conversation_id) REFERENCES ai_conversation(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI对话消息表';
 ```
 
-### 2.4 知识点映射表 `knowledge_points`（关联模块，此处定义接口）
+#### 2.1.3 Prompt模板表 (ai_prompt_template)
+
+| 字段名 | 类型 | 说明 | 约束 |
+|--------|------|------|------|
+| id | INT | 主键ID | PK, AUTO_INCREMENT |
+| template_code | VARCHAR(100) | 模板编码 | NOT NULL, UNIQUE |
+| name | VARCHAR(200) | 模板名称 | NOT NULL |
+| category | VARCHAR(50) | 分类：question_answer, tutoring, homework_help等 | |
+| applicable_grade | VARCHAR(100) | 适用年级：multiple choice, range | |
+| applicable_subject | VARCHAR(100) | 适用学科 | |
+| template_content | TEXT | 模板内容（支持变量占位符） | NOT NULL |
+| variables | JSON | 变量定义 | |
+| system_prompt | TEXT | 系统提示词 | |
+| priority | INT | 优先级 | DEFAULT 0 |
+| is_active | BOOLEAN | 是否启用 | DEFAULT TRUE |
+| created_at | TIMESTAMP | 创建时间 | DEFAULT CURRENT_TIMESTAMP |
+| updated_at | TIMESTAMP | 更新时间 | DEFAULT CURRENT_TIMESTAMP ON UPDATE |
+| created_by | BIGINT | 创建人 | |
+| version | VARCHAR(20) | 版本号 | |
 
 ```sql
--- 由内容服务管理，AI服务读取
-CREATE TABLE knowledge_points (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
-    subject         VARCHAR(20) NOT NULL,
-    stage           VARCHAR(20) NOT NULL,
-    grade           INT NOT NULL,
-    chapter_id      BIGINT COMMENT '所属章节ID',
-    name            VARCHAR(100) NOT NULL COMMENT '知识点名称',
-    description     TEXT COMMENT '知识点描述',
-    difficulty      TINYINT COMMENT '难度: 1-5',
-    prerequisites   JSON COMMENT '前置知识点ID列表',
-    keywords        JSON COMMENT '关键词 ["二元一次方程","消元法"]',
-    embedding       BLOB COMMENT '向量嵌入（用于RAG检索）',
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    
-    INDEX idx_subject_stage (subject, stage, grade),
-    INDEX idx_chapter (chapter_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识点';
+CREATE TABLE ai_prompt_template (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    template_code VARCHAR(100) NOT NULL UNIQUE,
+    name VARCHAR(200) NOT NULL,
+    category VARCHAR(50),
+    applicable_grade VARCHAR(100),
+    applicable_subject VARCHAR(100),
+    template_content TEXT NOT NULL,
+    variables JSON COMMENT '变量定义',
+    system_prompt TEXT,
+    priority INT DEFAULT 0,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    created_by BIGINT,
+    version VARCHAR(20),
+    INDEX idx_category (category),
+    INDEX idx_is_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI Prompt模板表';
 ```
 
-### 2.5 Prompt 模板配置表 `prompt_templates`
+#### 2.1.4 RAG检索记录表 (ai_rag_retrieval)
+
+| 字段名 | 类型 | 说明 | 约束 |
+|--------|------|------|------|
+| id | BIGINT | 主键ID | PK, AUTO_INCREMENT |
+| message_id | BIGINT | 消息ID | NOT NULL, FK |
+| query_text | TEXT | 查询文本 | NOT NULL |
+| embedding_vector | JSON | 向量表示 | |
+| retrieved_count | INT | 检索到的文档数量 | |
+| top_k | INT | 检索参数Top-K | |
+| threshold | DECIMAL(5,4) | 相似度阈值 | |
+| retrieval_time_ms | INT | 检索耗时（毫秒） | |
+| sources | JSON | 检索来源详情 | |
+| used_in_context | BOOLEAN | 是否用于上下文构建 | DEFAULT TRUE |
+| created_at | TIMESTAMP | 创建时间 | DEFAULT CURRENT_TIMESTAMP |
 
 ```sql
-CREATE TABLE prompt_templates (
-    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
-    scene           VARCHAR(50) NOT NULL COMMENT '场景: general_qa/math_solve/essay_review/recite/young_learner',
-    stage           VARCHAR(20) NOT NULL DEFAULT '*' COMMENT '学段: */preschool/primary/junior/senior',
-    subject         VARCHAR(20) NOT NULL DEFAULT '*' COMMENT '学科: */chinese/math/...',
-    system_prompt   TEXT NOT NULL COMMENT '系统提示词',
-    output_format   TEXT COMMENT '输出格式要求',
-    safety_rules    TEXT COMMENT '安全规则附加',
-    version         INT NOT NULL DEFAULT 1 COMMENT '版本号',
-    is_active       TINYINT NOT NULL DEFAULT 1 COMMENT '是否启用',
-    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
-    UNIQUE KEY uk_scene_version (scene, stage, subject, version),
-    INDEX idx_active (scene, stage, subject, is_active)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Prompt模板配置';
+CREATE TABLE ai_rag_retrieval (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    message_id BIGINT NOT NULL,
+    query_text TEXT NOT NULL,
+    embedding_vector JSON,
+    retrieved_count INT,
+    top_k INT,
+    threshold DECIMAL(5,4),
+    retrieval_time_ms INT,
+    sources JSON COMMENT '检索来源详情',
+    used_in_context BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_message_id (message_id),
+    FOREIGN KEY (message_id) REFERENCES ai_message(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='RAG检索记录表';
 ```
 
----
+#### 2.1.5 模型调用记录表 (ai_model_call)
 
-## 3. AI 调用架构
+| 字段名 | 类型 | 说明 | 约束 |
+|--------|------|------|------|
+| id | BIGINT | 主键ID | PK, AUTO_INCREMENT |
+| message_id | BIGINT | 消息ID | FK |
+| model_provider | VARCHAR(50) | 模型供应商 | NOT NULL |
+| model_id | VARCHAR(50) | 模型ID | NOT NULL |
+| request_payload | MEDIUMTEXT | 请求负载 | |
+| response_payload | MEDIUMTEXT | 响应负载 | |
+| input_tokens | INT | 输入Token数 | |
+| output_tokens | INT | 输出Token数 | |
+| total_tokens | INT | 总Token数 | |
+| latency_ms | INT | 响应延迟（毫秒） | |
+| status_code | INT | HTTP状态码 | |
+| error_message | TEXT | 错误信息 | |
+| cost_cny | DECIMAL(10,4) | 成本（人民币） | |
+| created_at | TIMESTAMP | 创建时间 | DEFAULT CURRENT_TIMESTAMP |
 
-### 3.1 整体调用链路
+```sql
+CREATE TABLE ai_model_call (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    message_id BIGINT,
+    model_provider VARCHAR(50) NOT NULL,
+    model_id VARCHAR(50) NOT NULL,
+    request_payload MEDIUMTEXT,
+    response_payload MEDIUMTEXT,
+    input_tokens INT,
+    output_tokens INT,
+    total_tokens INT,
+    latency_ms INT,
+    status_code INT,
+    error_message TEXT,
+    cost_cny DECIMAL(10,4) COMMENT '成本（人民币）',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_message_id (message_id),
+    INDEX idx_model_provider (model_provider),
+    INDEX idx_created_at (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='模型调用记录表';
+```
+
+### 2.2 Redis缓存结构
+
+#### 2.2.1 会话上下文缓存
+```
+Key: ai:session:{session_id}:context
+TTL: 3600s (1小时)
+Value: {
+  "userId": 123456,
+  "gradeLevel": "小学三年级",
+  "subjectId": 1,
+  "textbookId": 1,
+  "recentMessages": [
+    {"role": 1, "content": "..."},
+    {"role": 2, "content": "..."}
+  ],
+  "totalTokens": 1500,
+  "lastActivityAt": "2026-06-17T06:30:00Z"
+}
+```
+
+#### 2.2.2 用户限流缓存
+```
+Key: ai:rate_limit:{user_id}:{date}
+TTL: 86400s (1天)
+Value: {
+  "questionCount": 10,
+  "tokenUsed": 5000,
+  "lastResetAt": "2026-06-17T00:00:00Z"
+}
+```
+
+#### 2.2.3 Prompt模板缓存
+```
+Key: ai:prompt:template:{template_code}
+TTL: 1800s (30分钟)
+Value: {
+  "templateCode": "elementary_math_tutoring",
+  "name": "小学数学辅导",
+  "templateContent": "...",
+  "variables": {...},
+  "systemPrompt": "..."
+}
+```
+
+## 3. API接口设计
+
+### 3.1 创建会话
+
+**接口路径:** `POST /api/v1/ai/conversations`
+
+**请求体:**
+```json
+{
+  "title": "数学作业辅导",
+  "subjectId": 1,
+  "gradeLevel": "小学三年级",
+  "textbookId": 1
+}
+```
+
+**响应体:**
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "conversationId": 1001,
+    "sessionId": "sess_abc123xyz",
+    "title": "数学作业辅导",
+    "status": 1,
+    "createdAt": "2026-06-17T06:30:00.000Z"
+  }
+}
+```
+
+**错误码:**
+- `4001`: 参数错误
+- `4003`: 非法年级
+- `4004`: 教材版本不存在
+- `5001`: 系统内部错误
+
+### 3.2 发送消息
+
+**接口路径:** `POST /api/v1/ai/conversations/{session_id}/messages`
+
+**请求体:**
+```json
+{
+  "role": 1,
+  "contentType": 1,
+  "textContent": "小明有5个苹果，吃了2个，还剩几个？",
+  "imageUrls": [],
+  "enableRag": true,
+  "enableSafety": true
+}
+```
+
+**响应体:**
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "messageId": 2001,
+    "role": 2,
+    "textContent": "小明原来有5个苹果，吃了2个后，还剩下几个呢？让我们来算一算...\n\n**解题步骤：**\n1. 原来有：5个\n2. 吃掉了：2个\n3. 还剩下：5 - 2 = 3个\n\n**答案：** 小明还剩下3个苹果。\n\n你理解了吗？要不要我再换一种方法讲一遍？",
+    "knowledgePoints": [
+      {"id": 101, "name": "减法运算", "chapter": "第一章"},
+      {"id": 102, "name": "应用题理解", "chapter": "第一章"}
+    ],
+    "ragSources": [
+      {
+        "type": "knowledge_point",
+        "title": "减法的基本概念",
+        "relevance": 0.95
+      }
+    ],
+    "tokens": {
+      "input": 25,
+      "output": 180
+    },
+    "latency": 1234
+  }
+}
+```
+
+**错误码:**
+- `4001`: 参数错误
+- `4005`: 会话不存在或已结束
+- `4006`: 超出每日提问次数限制
+- `4007`: 内容包含敏感信息
+- `4008`: AI服务暂时不可用
+- `5001`: 系统内部错误
+
+### 3.3 获取会话历史
+
+**接口路径:** `GET /api/v1/ai/conversations/{session_id}/messages`
+
+**请求参数:**
+- `page`: 页码（默认1）
+- `pageSize`: 每页数量（默认20）
+- `sinceMessageId`: 从某条消息ID之后的消息
+
+**响应体:**
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "messages": [
+      {
+        "messageId": 2001,
+        "role": 1,
+        "contentType": 1,
+        "textContent": "小明有5个苹果...",
+        "createdAt": "2026-06-17T06:30:00.000Z"
+      },
+      {
+        "messageId": 2002,
+        "role": 2,
+        "contentType": 1,
+        "textContent": "小明原来有5个苹果...",
+        "createdAt": "2026-06-17T06:30:01.234Z"
+      }
+    ],
+    "pagination": {
+      "page": 1,
+      "pageSize": 20,
+      "total": 2,
+      "hasMore": false
+    }
+  }
+}
+```
+
+### 3.4 获取会话列表
+
+**接口路径:** `GET /api/v1/ai/conversations`
+
+**请求参数:**
+- `status`: 状态筛选（1-进行中，2-已结束）
+- `subjectId`: 学科筛选
+- `page`: 页码（默认1）
+- `pageSize`: 每页数量（默认10）
+
+**响应体:**
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "conversations": [
+      {
+        "conversationId": 1001,
+        "sessionId": "sess_abc123xyz",
+        "title": "数学作业辅导",
+        "subjectId": 1,
+        "gradeLevel": "小学三年级",
+        "totalMessages": 5,
+        "status": 1,
+        "createdAt": "2026-06-17T06:30:00.000Z",
+        "lastMessageAt": "2026-06-17T06:35:00.000Z"
+      }
+    ],
+    "pagination": {
+      "page": 1,
+      "pageSize": 10,
+      "total": 1,
+      "hasMore": false
+    }
+  }
+}
+```
+
+### 3.5 提交反馈
+
+**接口路径:** `POST /api/v1/ai/messages/{message_id}/feedback`
+
+**请求体:**
+```json
+{
+  "score": 5,
+  "tags": ["讲解清晰", "有帮助"],
+  "comment": "讲得很清楚，我懂了"
+}
+```
+
+**响应体:**
+```json
+{
+  "code": 0,
+  "message": "feedback submitted",
+  "data": null
+}
+```
+
+### 3.6 停止生成
+
+**接口路径:** `POST /api/v1/ai/conversations/{session_id}/stop`
+
+**响应体:**
+```json
+{
+  "code": 0,
+  "message": "generation stopped",
+  "data": {
+    "messageId": 2002,
+    "textContent": "小明原来有5个苹果，吃了2个后...",
+    "isStopped": true
+  }
+}
+```
+
+## 4. 核心业务逻辑
+
+### 4.1 消息处理流程
+
+```python
+async def process_message(user_id: int, session_id: str, request: MessageRequest):
+    # 1. 权限和限流检查
+    await check_permission_and_rate_limit(user_id)
+
+    # 2. 获取会话上下文
+    context = await get_conversation_context(session_id)
+
+    # 3. 内容安全审核
+    safety_result = await safety_check(request.textContent)
+    if not safety_result.is_safe:
+        raise ContentSafetyError(safety_result.reason)
+
+    # 4. 保存用户消息
+    user_message = await save_user_message(session_id, request)
+
+    # 5. 构建Prompt上下文
+    prompt_context = await build_prompt_context(
+        user_id=user_id,
+        session_id=session_id,
+        user_message=request.textContent,
+        context=context
+    )
+
+    # 6. 调用AI模型
+    ai_response = await call_ai_model(prompt_context)
+
+    # 7. 后处理（适龄化、格式化）
+    processed_response = await post_process_response(
+        ai_response,
+        context.grade_level,
+        context.subject_id
+    )
+
+    # 8. 保存AI回复
+    ai_message = await save_ai_message(
+        session_id,
+        processed_response,
+        ai_response.metadata
+    )
+
+    # 9. 更新缓存和统计
+    await update_session_cache(session_id, ai_message)
+    await update_usage_statistics(user_id, ai_response.tokens)
+
+    return ai_message
+```
+
+### 4.2 Prompt上下文构建
+
+```python
+async def build_prompt_context(
+    user_id: int,
+    session_id: str,
+    user_message: str,
+    context: ConversationContext
+) -> PromptContext:
+
+    # 1. 获取用户画像
+    user_profile = await get_user_profile(user_id)
+
+    # 2. 选择合适的Prompt模板
+    template = await select_prompt_template(
+        grade_level=context.grade_level,
+        subject_id=context.subject_id,
+        intent=classify_intent(user_message)
+    )
+
+    # 3. RAG检索增强
+    rag_results = []
+    if template.enable_rag:
+        rag_results = await rag_retrieve(
+            query=user_message,
+            subject_id=context.subject_id,
+            grade_level=context.grade_level,
+            textbook_id=context.textbook_id,
+            top_k=template.rag_top_k,
+            threshold=template.rag_threshold
+        )
+
+    # 4. 获取对话历史（最近N轮）
+    recent_history = await get_recent_messages(session_id, limit=template.history_window)
+
+    # 5. 构建变量
+    variables = {
+        "user_name": user_profile.nickname or "同学",
+        "grade_level": context.grade_level,
+        "subject_name": get_subject_name(context.subject_id),
+        "question": user_message,
+        "knowledge_points": extract_knowledge_points(rag_results),
+        "history": format_conversation_history(recent_history),
+        "current_date": datetime.now().strftime("%Y-%m-%d")
+    }
+
+    # 6. 渲染Prompt
+    system_prompt = render_template(template.system_prompt, variables)
+    user_prompt = render_template(template.template_content, variables)
+
+    return PromptContext(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        rag_sources=rag_results,
+        variables=variables,
+        metadata={
+            "template_code": template.template_code,
+            "model_id": template.default_model_id
+        }
+    )
+```
+
+### 4.3 RAG检索实现
+
+```python
+async def rag_retrieve(
+    query: str,
+    subject_id: int,
+    grade_level: str,
+    textbook_id: int,
+    top_k: int = 5,
+    threshold: float = 0.7
+) -> List[RAGSource]:
+
+    # 1. 生成查询向量
+    embedding = await generate_embedding(query)
+
+    # 2. 构建检索过滤器
+    filters = {
+        "subject_id": subject_id,
+        "grade_level": grade_level,
+        "textbook_id": textbook_id,
+        "is_active": True
+    }
+
+    # 3. 向量相似度检索
+    vector_results = await vector_search(
+        collection="knowledge_points",
+        vector=embedding,
+        filters=filters,
+        top_k=top_k * 2,  # 多取一些用于过滤
+        score_threshold=threshold
+    )
+
+    # 4. 二次过滤和排序
+    filtered_results = []
+    for result in vector_results:
+        if result.score >= threshold:
+            filtered_results.append(RAGSource(
+                type="knowledge_point",
+                id=result.payload["id"],
+                title=result.payload["title"],
+                content=result.payload["content"],
+                chapter=result.payload["chapter"],
+                relevance=result.score
+            ))
+
+    # 5. 按相关度排序并返回Top-K
+    filtered_results.sort(key=lambda x: x.relevance, reverse=True)
+    return filtered_results[:top_k]
+```
+
+### 4.4 适龄化处理
+
+```python
+async def post_process_response(
+    response: AIResponse,
+    grade_level: str,
+    subject_id: int
+) -> ProcessedResponse:
+
+    # 1. 根据年级调整语言复杂度
+    if "小学" in grade_level:
+        response = simplify_language_for_elementary(response)
+    elif "初中" in grade_level:
+        response = adjust_for_middle_school(response)
+    elif "高中" in grade_level:
+        # 高中生可以接受更复杂的表达
+        pass
+
+    # 2. 格式化数学公式
+    if subject_id in [1, 2, 5, 6]:  # 数学、物理、化学、生物
+        response = format_math_formulas(response)
+
+    # 3. 添加学习建议
+    response = append_learning_tips(response, grade_level)
+
+    # 4. 格式化为Markdown
+    response = format_as_markdown(response)
+
+    return response
+```
+
+### 4.5 流式响应处理
+
+```python
+async def stream_response(session_id: str, prompt_context: PromptContext):
+    # 1. 建立SSE连接
+    async with sse_connection(session_id) as conn:
+        # 2. 调用流式AI模型
+        stream = await call_ai_model_stream(prompt_context)
+
+        # 3. 逐块发送给客户端
+        accumulated_content = ""
+        async for chunk in stream:
+            accumulated_content += chunk.content
+
+            # 发送SSE事件
+            await conn.send({
+                "event": "message_delta",
+                "data": {
+                    "content": chunk.content,
+                    "isComplete": chunk.is_complete,
+                    "tokens": chunk.tokens
+                }
+            })
+
+            # 如果是停止信号，中断流
+            if await is_generation_stopped(session_id):
+                await conn.send({
+                    "event": "generation_stopped",
+                    "data": {"content": accumulated_content}
+                })
+                break
+
+        # 4. 保存完整回复
+        await save_ai_message(session_id, accumulated_content)
+
+        # 5. 发送完成事件
+        await conn.send({
+            "event": "message_complete",
+            "data": {"messageId": message_id}
+        })
+```
+
+## 5. 状态流转
+
+### 5.1 会话状态机
+
+```
+创建会话
+    ↓
+[进行中] (status=1)
+    ├─ 用户继续对话 → [进行中]
+    ├─ 超时无活动 → [已归档] (status=3)
+    ├─ 用户手动结束 → [已结束] (status=2)
+    └─ 系统归档 → [已归档] (status=3)
+    ↓
+[已结束] (status=2)
+    └─ 用户重新打开 → [进行中] (status=1)
+    ↓
+[已归档] (status=3)
+    └─ (不可逆)
+```
+
+### 5.2 消息处理状态
 
 ```
 用户发送消息
     ↓
-客户端 → POST /api/v1/ai/chat
+[安全审核中]
+    ├─ 审核通过 → [AI处理中]
+    └─ 审核失败 → [已拒绝]
     ↓
-API网关 → 鉴权 + 额度检查
+[AI处理中]
+    ├─ 生成成功 → [已完成]
+    ├─ 超时 → [已超时]
+    └─ 模型错误 → [已失败]
     ↓
-AI服务接收
-    ↓
-┌─────────────────────────────────────────────┐
-│ 1. 加载用户上下文（学段/年级/学科/教材版本）    │
-│ 2. 加载对话历史（最近 N 条消息）               │
-│ 3. 意图识别 + 知识点提取                       │
-│ 4. RAG 检索相关教材内容/知识点                  │
-│ 5. 选择 Prompt 模板                            │
-│ 6. 组装最终 Prompt                             │
-│ 7. 调用大模型（流式）                          │
-│ 8. 安全审核输出                                │
-│ 9. 后处理：知识点关联、结构化提取               │
-│ 10. 存储消息 + 扣减额度                       │
-└─────────────────────────────────────────────┘
-    ↓
-流式返回给客户端（SSE）
+[已完成]
+    └─ 用户反馈 → [已评价]
 ```
 
-### 3.2 模型路由策略
+## 6. 错误处理
+
+### 6.1 错误分类与处理策略
+
+| 错误类型 | 错误码 | 处理策略 | 用户提示 |
+|---------|--------|---------|---------|
+| 参数错误 | 4001 | 直接返回 | "请求参数有误，请检查后重试" |
+| 会话不存在 | 4005 | 检查会话ID | "会话不存在或已失效" |
+| 超出限流 | 4006 | 显示限制和重置时间 | "今日提问次数已用完，明天再试吧" |
+| 内容违规 | 4007 | 拦截并记录 | "内容包含敏感信息，请修改后重试" |
+| 模型超时 | 5002 | 自动重试1次 | "AI正在思考中，请稍候..." |
+| 模型不可用 | 4008 | 切换备用模型 | "AI服务繁忙，已为您切换其他模型" |
+| 系统错误 | 5001 | 记录日志并告警 | "系统繁忙，请稍后再试" |
+
+### 6.2 重试策略
 
 ```python
-# 模型路由表：根据场景+学科选择最优模型
-MODEL_ROUTING = {
-    # 场景 -> (首选模型, 备选模型)
-    "general_qa":      ("glm-5",        "gpt-4o-mini"),
-    "math_solve":      ("deepseek-r1",  "glm-5"),
-    "physics_solve":   ("deepseek-r1",  "glm-5"),
-    "chemistry_solve": ("deepseek-r1",  "glm-5"),
-    "essay_review":    ("gpt-4o",       "glm-5"),
-    "english_qa":      ("gpt-4o",       "glm-5"),
-    "young_learner":   ("glm-5",        "gpt-4o-mini"),
-    "recite_check":    ("glm-5",        "gpt-4o-mini"),
-}
-
-# 模型降级链：首选模型超时/异常时自动切换
-FALLBACK_CHAIN = {
-    "glm-5":        ["gpt-4o-mini", "deepseek-chat"],
-    "deepseek-r1":  ["glm-5", "gpt-4o-mini"],
-    "gpt-4o":       ["glm-5", "deepseek-chat"],
-}
-```
-
-### 3.3 RAG 检索流程
-
-```python
-class RAGService:
-    """检索增强生成服务"""
-    
-    def __init__(self, vector_store, knowledge_repo, embedding_client):
-        self.vector_store = vector_store      # Milvus/pgvector
-        self.knowledge_repo = knowledge_repo  # 知识点+教材内容
-        self.embedding = embedding_client     # 嵌入模型
-    
-    async def retrieve(
-        self, 
-        query: str, 
-        subject: str, 
-        stage: str, 
-        grade: int,
-        textbook_edition: str,
-        top_k: int = 5
-    ) -> list[RAGResult]:
-        """
-        检索与问题相关的教材内容和知识点
-        
-        返回按相关性排序的结果列表，每个结果包含：
-        - source_type: 'textbook' | 'knowledge_point' | 'question_example'
-        - content: 原文内容
-        - relevance_score: 相关性分数
-        - metadata: 章节名、知识点名等
-        """
-        # 1. 生成查询向量
-        query_embedding = await self.embedding.embed(query)
-        
-        # 2. 向量检索（带学科+学段过滤）
-        filters = {
-            "subject": subject,
-            "stage": stage,
-            "grade": {"$gte": grade - 1, "$lte": grade + 1},
-        }
-        vector_results = await self.vector_store.search(
-            collection="knowledge_base",
-            vector=query_embedding,
-            filter=filters,
-            top_k=top_k * 2,  # 多取一些，后续精排
-        )
-        
-        # 3. 关键词检索补充（防止向量检索遗漏精确匹配）
-        keyword_results = await self.knowledge_repo.search_by_keywords(
-            query=query,
-            subject=subject,
-            stage=stage,
-            grade=grade,
-            textbook_edition=textbook_edition,
-            limit=top_k,
-        )
-        
-        # 4. 合并去重 + 精排
-        merged = self._merge_and_rerank(query, vector_results, keyword_results)
-        
-        return merged[:top_k]
-```
-
----
-
-## 4. API 接口设计
-
-### 4.1 创建对话
-
-```
-POST /api/v1/ai/conversations
-Authorization: Bearer <token>
-```
-
-**Request:**
-```json
-{
-    "subject": "math",
-    "title": "二元一次方程组怎么解？"
-}
-```
-
-**Response:**
-```json
-{
-    "code": 0,
-    "data": {
-        "conversation_id": 200001,
-        "subject": "math",
-        "title": "二元一次方程组怎么解？",
-        "created_at": "2026-05-18T18:30:00+08:00"
-    }
-}
-```
-
-### 4.2 发送消息（流式响应）
-
-```
-POST /api/v1/ai/chat
-Authorization: Bearer <token>
-Content-Type: application/json
-Accept: text/event-stream
-```
-
-**Request:**
-```json
-{
-    "conversation_id": 200001,
-    "content": "解方程组：2x + 3y = 7, x - y = 1",
-    "content_type": "text",
-    "attachments": []
-}
-```
-
-**Response（SSE 流式）:**
-
-```
-event: message_start
-data: {"message_id": 300001, "model": "deepseek-r1"}
-
-event: thinking
-data: {"content": "这是一个二元一次方程组，可以用代入法或加减消元法..."}
-
-event: content_delta
-data: {"content": "## 解题思路\n\n"}
-
-event: content_delta
-data: {"content": "这是一道**二元一次方程组**问题，我们可以用**代入消元法**来解。\n\n"}
-
-event: content_delta
-data: {"content": "### 第一步：从较简单的方程入手\n从第二个方程 $x - y = 1$ 可以得到：\n$$x = y + 1$$\n\n"}
-
-event: content_delta
-data: {"content": "### 第二步：代入另一个方程\n将 $x = y + 1$ 代入第一个方程：\n$$2(y+1) + 3y = 7$$\n$$2y + 2 + 3y = 7$$\n$$5y = 5$$\n$$y = 1$$\n\n"}
-
-event: content_delta
-data: {"content": "### 第三步：回代求 x\n$$x = y + 1 = 1 + 1 = 2$$\n\n"}
-
-event: content_delta
-data: {"content": "### ✅ 最终答案\n$$\\boxed{x = 2,\\ y = 1}$$\n\n**验证**：$2(2) + 3(1) = 7$ ✓，$2 - 1 = 1$ ✓\n\n💡 **方法总结**：当方程组中某个未知数的系数为 1 时，用**代入消元法**最方便。"}
-
-event: metadata
-data: {
-    "message_id": 300001,
-    "answer_summary": "用代入消元法解方程组，x=2, y=1",
-    "key_points": ["二元一次方程组", "代入消元法"],
-    "related_kp_ids": [1001, 1002],
-    "related_chapter": "人教版七年级下册第八章",
-    "step_count": 3,
-    "input_tokens": 850,
-    "output_tokens": 320,
-    "latency_ms": 4200,
-    "quick_actions": ["再讲简单点", "生成同类题", "加入错题本", "换一种解法"]
-}
-
-event: message_end
-data: {"message_id": 300001}
-```
-
-### 4.3 发送消息（非流式，弱网备用）
-
-```
-POST /api/v1/ai/chat/sync
-Authorization: Bearer <token>
-```
-
-同样的请求体，但返回完整 JSON 响应而非 SSE 流。
-
-**Response:**
-```json
-{
-    "code": 0,
-    "data": {
-        "user_message": {
-            "id": 300000,
-            "role": "user",
-            "content": "解方程组：2x + 3y = 7, x - y = 1",
-            "created_at": "2026-05-18T18:30:01+08:00"
-        },
-        "assistant_message": {
-            "id": 300001,
-            "role": "assistant",
-            "content": "## 解题思路\n\n...(完整内容同上)...",
-            "answer_summary": "用代入消元法解方程组，x=2, y=1",
-            "key_points": ["二元一次方程组", "代入消元法"],
-            "related_chapter": "人教版七年级下册第八章",
-            "step_count": 3,
-            "quick_actions": ["再讲简单点", "生成同类题", "加入错题本", "换一种解法"],
-            "created_at": "2026-05-18T18:30:05+08:00"
-        }
-    }
-}
-```
-
-### 4.4 获取对话历史
-
-```
-GET /api/v1/ai/conversations/{conversation_id}/messages?cursor={msg_id}&limit=20
-Authorization: Bearer <token>
-```
-
-**Response:**
-```json
-{
-    "code": 0,
-    "data": {
-        "messages": [
-            {
-                "id": 300001,
-                "role": "assistant",
-                "content": "...",
-                "answer_summary": "...",
-                "key_points": ["..."],
-                "created_at": "2026-05-18T18:30:05+08:00"
-            },
-            {
-                "id": 300000,
-                "role": "user",
-                "content": "解方程组：2x + 3y = 7, x - y = 1",
-                "attachments": [],
-                "created_at": "2026-05-18T18:30:01+08:00"
-            }
-        ],
-        "has_more": false,
-        "conversation": {
-            "id": 200001,
-            "title": "二元一次方程组怎么解？",
-            "subject": "math",
-            "message_count": 2
-        }
-    }
-}
-```
-
-### 4.5 对话列表
-
-```
-GET /api/v1/ai/conversations?status=active&page=1&size=20
-Authorization: Bearer <token>
-```
-
-**Response:**
-```json
-{
-    "code": 0,
-    "data": {
-        "items": [
-            {
-                "id": 200001,
-                "title": "二元一次方程组怎么解？",
-                "subject": "math",
-                "last_message_at": "2026-05-18T18:30:05+08:00",
-                "message_count": 2
-            }
-        ],
-        "total": 15,
-        "page": 1,
-        "size": 20
-    }
-}
-```
-
-### 4.6 消息反馈
-
-```
-POST /api/v1/ai/messages/{message_id}/feedback
-Authorization: Bearer <token>
-```
-
-**Request:**
-```json
-{
-    "rating": 1,
-    "feedback_tag": "wrong_answer",
-    "feedback_text": "计算过程第三步有误"
-}
-```
-
-**Response:**
-```json
-{
-    "code": 0,
-    "message": "感谢反馈，我们会持续优化"
-}
-```
-
-### 4.7 快捷操作
-
-```
-POST /api/v1/ai/chat/action
-Authorization: Bearer <token>
-```
-
-**Request:**
-```json
-{
-    "conversation_id": 200001,
-    "action": "simplify",         // simplify | similar_question | add_mistake | alternative_method
-    "ref_message_id": 300001      // 参考哪条AI回复
-}
-```
-
-**Response:** 同 chat 接口的 SSE 流式/同步响应
-
-**action 含义:**
-| action | 含义 | 处理方式 |
-|--------|------|---------|
-| `simplify` | 再讲简单点 | 在原对话基础上生成更通俗的讲解 |
-| `similar_question` | 生成同类题 | 基于原题知识点生成一道类似练习题 |
-| `add_mistake` | 加入错题本 | 调用错题服务，将原对话中的题目收录 |
-| `alternative_method` | 换一种解法 | 用不同方法重新解答 |
-
-### 4.8 删除对话
-
-```
-DELETE /api/v1/ai/conversations/{conversation_id}
-Authorization: Bearer <token>
-```
-
-软删除（status 置为 0），不物理删除消息数据。
-
----
-
-## 5. Prompt 编排设计
-
-### 5.1 Prompt 组装结构
-
-最终发送给大模型的 Prompt 由以下部分拼接：
-
-```
-[系统角色设定]        ← 来自 prompt_templates.system_prompt
-[安全规则]           ← 来自 prompt_templates.safety_rules
-[用户画像注入]        ← 动态生成：学段/年级/学科/教材版本/学习目标
-[输出格式要求]        ← 来自 prompt_templates.output_format
-[RAG检索结果]        ← 来自知识库检索（如有命中）
-[对话历史]           ← 最近 N 条消息
-[当前用户消息]        ← 用户本次输入
-```
-
-### 5.2 系统提示词示例（小学数学）
-
-```python
-PRIMARY_MATH_SYSTEM_PROMPT = """你是一位经验丰富、耐心的数学老师，正在辅导一名小学{grade_label}学生。
-
-## 你的教学原则
-1. **先引导后给出**：不要直接给出答案，先引导学生思考
-2. **语言简单**：用小学生能理解的语言，避免抽象概念
-3. **举生活例子**：多用生活中的例子帮助理解
-4. **分步讲解**：每一步都要说清楚为什么
-5. **正面鼓励**：多鼓励学生，"你问得很好！""这个思路很棒！"
-
-## 输出格式
-- 使用 Markdown 格式
-- 数学公式用 LaTeX 语法（$...$ 和 $$...$$）
-- 解题分步骤，用"### 第一步"格式
-- 最终答案用 ✅ 标注
-- 结尾给出 💡 方法总结
-
-## 禁止行为
-- 直接给出答案而不讲解过程
-- 使用超过该年级水平的概念
-- 跳过中间步骤"""
-```
-
-### 5.3 系统提示词示例（高中物理）
-
-```python
-SENIOR_PHYSICS_SYSTEM_PROMPT = """你是一位专业的物理学科辅导教师，正在辅导一名高中{grade_label}学生。
-
-## 教学风格
-1. **严谨推导**：每一步推导都注明依据（物理定律/公式）
-2. **模型识别**：先判断物理模型（匀变速/圆周/电磁感应等），再列方程
-3. **单位意识**：始终关注单位换算和量纲检验
-4. **易错提醒**：主动指出常见错误（如正方向选取、受力分析遗漏等）
-5. **方法对比**：如有多种解法，简要对比优劣
-
-## 输出格式
-- 物理量使用标准符号（$v, a, F, E, B$ 等）
-- 解题步骤：审题 → 建模 → 列方程 → 求解 → 验证
-- 关键公式单独列出并标注来源定律
-- 易错点用 ⚠️ 标注
-- 提供答题规范建议（考试得分技巧）"""
-```
-
-### 5.4 用户画像动态注入
-
-```python
-def build_user_context(profile: StudentProfile) -> str:
-    """根据学生档案生成用户上下文片段"""
-    stage_labels = {
-        "preschool": "幼儿", "primary": "小学", 
-        "junior": "初中", "senior": "高中"
-    }
-    grade_label = STAGE_GRADE_MAP[profile.stage]["grades"].get(profile.grade, "")
-    
-    ctx = f"""
-<user_context>
-- 学段：{stage_labels[profile.stage]}
-- 年级：{grade_label}
-- 教材版本：{profile.textbook_edition or '未设置'}
-- 关注学科：{', '.join(profile.subjects or [])}
-- 学习目标：{profile.study_goal or '日常学习'}
-</user_context>"""
-    return ctx
-```
-
-### 5.5 RAG 上下文注入
-
-```python
-def build_rag_context(rag_results: list[RAGResult]) -> str:
-    """将 RAG 检索结果注入 Prompt"""
-    if not rag_results:
-        return ""
-    
-    parts = ["<reference_materials>"]
-    for i, r in enumerate(rag_results, 1):
-        parts.append(f"""
-<reference_{i}>
-来源：{r.source_type} | 章节：{r.metadata.get('chapter', '')} | 知识点：{r.metadata.get('kp_name', '')}
-内容：{r.content}
-</reference_{i}>""")
-    parts.append("</reference_materials>")
-    parts.append("请参考以上教材内容回答学生问题。如果参考材料与问题不相关，可以忽略。")
-    
-    return "\n".join(parts)
-```
-
----
-
-## 6. 上下文管理
-
-### 6.1 对话历史窗口
-
-```python
-# 对话历史管理策略
-CONTEXT_CONFIG = {
-    "max_history_messages": 20,      # 最大历史消息数
-    "max_history_tokens": 4000,      # 历史消息最大 token 数
-    "summary_threshold": 15,         # 超过此数量触发摘要压缩
-    "system_prompt_max_tokens": 1500, # 系统提示词最大 token 数
-    "rag_context_max_tokens": 2000,  # RAG 检索结果最大 token 数
-    "total_max_input_tokens": 8000,  # 总输入 token 上限（不含用户当前消息）
-}
-
-class ContextManager:
-    """管理对话上下文，控制 token 预算"""
-    
-    def __init__(self, db_session, tokenizer):
-        self.db = db_session
-        self.tokenizer = tokenizer
-    
-    async def build_context(
-        self, 
-        conversation_id: int,
-        user_message: str,
-        profile: StudentProfile,
-    ) -> ChatContext:
-        """
-        构建完整的对话上下文
-        
-        Token 预算分配：
-        - system_prompt: ≤1500 tokens
-        - rag_context: ≤2000 tokens  
-        - history: ≤4000 tokens
-        - 当前消息: 不限
-        """
-        # 1. 加载系统提示词
-        system_prompt = await self._load_system_prompt(profile)
-        
-        # 2. 加载对话历史
-        history = await self._load_history(
-            conversation_id, 
-            max_tokens=CONTEXT_CONFIG["max_history_tokens"]
-        )
-        
-        # 3. RAG 检索
-        rag_context = ""
-        rag_results = await rag_service.retrieve(
-            query=user_message,
-            subject=profile.subject or "general",
-            stage=profile.stage,
-            grade=profile.grade,
-            textbook_edition=profile.textbook_edition,
-        )
-        if rag_results:
-            rag_context = build_rag_context(rag_results)
-            # 检查 token 数，必要时截断
-            rag_tokens = self.tokenizer.count(rag_context)
-            if rag_tokens > CONTEXT_CONFIG["rag_context_max_tokens"]:
-                rag_context = self._truncate_rag(rag_results, CONTEXT_CONFIG["rag_context_max_tokens"])
-        
-        # 4. 压缩历史（如果过长）
-        history_text = self._serialize_history(history)
-        history_tokens = self.tokenizer.count(history_text)
-        if history_tokens > CONTEXT_CONFIG["max_history_tokens"]:
-            history = await self._summarize_older_messages(conversation_id, history)
-        
-        return ChatContext(
-            system_prompt=system_prompt,
-            rag_context=rag_context,
-            history=history,
-        )
-```
-
-### 6.2 历史消息摘要压缩
-
-```python
-async def _summarize_older_messages(
-    self, 
-    conversation_id: int, 
-    messages: list[Message]
-) -> list[Message]:
-    """
-    当历史消息过多时，将较早的消息压缩为摘要
-    
-    保留策略：
-    - 最近 6 条消息原样保留
-    - 更早的消息调用 LLM 生成摘要，存为一条 system 消息
-    """
-    if len(messages) <= 6:
-        return messages
-    
-    # 分割：旧消息 + 最近消息
-    old_messages = messages[:-6]
-    recent_messages = messages[-6:]
-    
-    # 调用 LLM 生成摘要（使用轻量模型降低成本）
-    old_text = self._serialize_history(old_messages)
-    summary_prompt = f"请用2-3句话概括以下学习对话的核心内容和讨论的知识点：\n\n{old_text}"
-    summary = await llm_client.generate(summary_prompt, model="gpt-4o-mini", max_tokens=200)
-    
-    # 返回：摘要 + 最近消息
-    summary_msg = Message(
-        conversation_id=conversation_id,
-        role="system",
-        content=f"[对话摘要] {summary}",
-    )
-    return [summary_msg] + recent_messages
-```
-
----
-
-## 7. 流式响应处理（SSE）
-
-### 7.1 SSE 事件类型
-
-| 事件 | 含义 | 数据 |
-|------|------|------|
-| `message_start` | 开始生成 | `{message_id, model}` |
-| `thinking` | 思维链输出 | `{content}` |
-| `content_delta` | 内容增量 | `{content}` |
-| `metadata` | 结构化元数据 | `{key_points, related_chapter, ...}` |
-| `message_end` | 生成完成 | `{message_id}` |
-| `error` | 发生错误 | `{code, message}` |
-
-### 7.2 服务端流式处理
-
-```python
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
-import json
-
-@router.post("/api/v1/ai/chat")
-async def chat(req: ChatRequest, request: Request, user_id: int = Depends(get_current_user_id)):
-    # 1. 前置检查
-    await check_ai_quota(user_id)
-    
-    # 2. 加载上下文
-    profile = await get_student_profile(user_id)
-    context = await context_manager.build_context(
-        req.conversation_id, req.content, profile
-    )
-    
-    # 3. 创建消息记录
-    user_msg = await save_user_message(req, user_id)
-    assistant_msg = await create_assistant_message(req.conversation_id, user_id)
-    
-    # 4. 选择模型
-    model = select_model(profile, req.content, context)
-    
-    # 5. 流式生成
-    async def event_stream():
-        full_content = ""
-        thinking_content = ""
-        start_time = time.time()
-        
-        try:
-            # 发送开始事件
-            yield f"event: message_start\ndata: {json.dumps({'message_id': assistant_msg.id, 'model': model})}\n\n"
-            
-            # 调用大模型
-            stream = await llm_client.stream(
-                model=model,
-                messages=context.to_messages() + [{"role": "user", "content": req.content}],
-                temperature=0.7,
-                max_tokens=2000,
-            )
-            
-            async for chunk in stream:
-                if chunk.type == "thinking":
-                    thinking_content += chunk.content
-                    yield f"event: thinking\ndata: {json.dumps({'content': chunk.content})}\n\n"
-                elif chunk.type == "content":
-                    full_content += chunk.content
-                    yield f"event: content_delta\ndata: {json.dumps({'content': chunk.content})}\n\n"
-            
-            # 6. 后处理
-            metadata = await post_process(full_content, profile, context.rag_results)
-            yield f"event: metadata\ndata: {json.dumps(metadata)}\n\n"
-            
-            # 7. 安全审核
-            safety_result = await safety_check(full_content)
-            if not safety_result.passed:
-                # 替换为安全提示
-                full_content = "抱歉，我无法回答这个问题。请换一个学习相关的问题吧。"
-                yield f"event: content_delta\ndata: {json.dumps({'content': '[内容已被安全过滤]'})}\n\n"
-            
-            # 8. 更新数据库
-            latency = int((time.time() - start_time) * 1000)
-            await update_assistant_message(
-                msg_id=assistant_msg.id,
-                content=full_content,
-                metadata=metadata,
-                model_name=model,
-                latency_ms=latency,
-                input_tokens=context.total_input_tokens,
-                output_tokens=len(full_content) // 2,  # 估算
-            )
-            
-            # 9. 扣减额度
-            await deduct_ai_quota(user_id)
-            
-            # 10. 记录学习行为
-            await record_learning_event(user_id, "ai_chat", {
-                "conversation_id": req.conversation_id,
-                "subject": profile.subject,
-                "knowledge_points": metadata.get("key_points", []),
-            })
-            
-            yield f"event: message_end\ndata: {json.dumps({'message_id': assistant_msg.id})}\n\n"
-            
-        except Exception as e:
-            logger.error(f"Stream error: {e}", exc_info=True)
-            yield f"event: error\ndata: {json.dumps({'code': 50001, 'message': '生成出错，请重试'})}\n\n"
-    
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-```
-
-### 7.3 客户端 SSE 消费
-
-```dart
-// Flutter 示例：消费 SSE 流
-Stream<ChatEvent> listenChatStream(String conversationId, String content) async* {
-  final response = await http.post(
-    Uri.parse('$baseUrl/api/v1/ai/chat'),
-    headers: {
-      'Authorization': 'Bearer $token',
-      'Content-Type': 'application/json',
-      'Accept': 'text/event-stream',
-    },
-    body: jsonEncode({
-      'conversation_id': conversationId,
-      'content': content,
-      'content_type': 'text',
-    }),
-  );
-  
-  // 解析 SSE 事件流
-  await for (final line in response.stream.transform(utf8.decoder).transform(const LineSplitter())) {
-    if (line.startsWith('event: ')) {
-      currentEvent = line.substring(7);
-    } else if (line.startsWith('data: ')) {
-      final data = jsonDecode(line.substring(6));
-      yield ChatEvent(type: currentEvent, data: data);
-    }
-  }
-}
-```
-
----
-
-## 8. 后处理与知识点关联
-
-### 8.1 结构化元数据提取
-
-```python
-class PostProcessor:
-    """AI 输出的后处理"""
-    
-    async def extract_metadata(
-        self, 
-        content: str, 
-        profile: StudentProfile,
-        rag_results: list[RAGResult]
-    ) -> MessageMetadata:
-        """
-        从 AI 回答中提取结构化信息
-        """
-        # 1. 提取关键知识点（使用轻量模型，降低成本）
-        kp_prompt = f"""从以下教学内容中提取关键知识点（最多5个），返回JSON数组：
-{content[:1000]}
-
-返回格式：["知识点1", "知识点2"]"""
-        
-        kp_response = await llm_client.generate(kp_prompt, model="gpt-4o-mini", max_tokens=100)
-        key_points = json.loads(kp_response)
-        
-        # 2. 关联知识库中的知识点ID
-        related_kp_ids = []
-        for kp_name in key_points:
-            kp = await knowledge_repo.find_by_name(kp_name, profile.subject, profile.stage)
-            if kp:
-                related_kp_ids.append(kp.id)
-        
-        # 3. 生成一句话总结
-        summary_prompt = f"用一句话概括以下教学内容的核心结论：\n{content[:500]}"
-        answer_summary = await llm_client.generate(summary_prompt, model="gpt-4o-mini", max_tokens=50)
-        
-        # 4. 统计解题步骤数
-        step_count = content.count("### 第") + content.count("### 步骤")
-        
-        # 5. 关联教材章节（优先使用 RAG 命中的章节）
-        related_chapter = ""
-        if rag_results:
-            related_chapter = rag_results[0].metadata.get("chapter", "")
-        
-        return MessageMetadata(
-            answer_summary=answer_summary.strip(),
-            key_points=key_points,
-            related_kp_ids=related_kp_ids,
-            related_chapter=related_chapter,
-            step_count=step_count or None,
-            quick_actions=self._generate_quick_actions(content, profile),
-        )
-    
-    def _generate_quick_actions(self, content: str, profile: StudentProfile) -> list[str]:
-        """根据回答内容生成可用的快捷操作"""
-        actions = []
-        if "### 第" in content or "步骤" in content:
-            actions.append("再讲简单点")
-            actions.append("换一种解法")
-            actions.append("生成同类题")
-            actions.append("加入错题本")
-        elif any(kw in content for kw in ["作文", "文章", "写作"]):
-            actions.append("帮我改一段")
-            actions.append("给个提纲")
-            actions.append("推荐素材")
-        else:
-            actions.append("再详细说说")
-            actions.append("举个大白话例子")
-            actions.append("我不太懂，换个讲法")
-        return actions
-```
-
----
-
-## 9. 安全过滤
-
-### 9.1 输入过滤
-
-```python
-class InputSafetyChecker:
-    """用户输入安全检查"""
-    
-    BLOCKED_PATTERNS = [
-        # 非学习相关请求
-        r"(帮我写|给我写).{0,5}(作文|文章).{0,5}(不要|不用).{0,5}(学习|思考)",
-        r"(直接给|只要).{0,5}答案",
-        r"(帮我做|替我做).{0,5}作业",
-        # 敏感话题
-        # ... (通过配置表管理)
-    ]
-    
-    async def check(self, content: str, user_type: str) -> SafetyResult:
-        # 1. 正则规则匹配
-        for pattern in self.BLOCKED_PATTERNS:
-            if re.search(pattern, content, re.IGNORECASE):
-                return SafetyResult(
-                    passed=False,
-                    reason="BLOCKED_PATTERN",
-                    redirect_hint="建议你先自己想一想，我可以给你提示和讲解～"
-                )
-        
-        # 2. 调用内容安全API（阿里/腾讯）
-        safety_result = await safety_api.text_check(content)
-        if not safety_result.passed:
-            return SafetyResult(
-                passed=False,
-                reason=f"CONTENT_UNSAFE:{safety_result.label}",
-            )
-        
-        return SafetyResult(passed=True)
-```
-
-### 9.2 输出过滤
-
-```python
-class OutputSafetyChecker:
-    """AI 输出安全检查"""
-    
-    async def check(self, content: str) -> SafetyResult:
-        # 1. 调用内容安全API
-        safety_result = await safety_api.text_check(content)
-        if not safety_result.passed:
-            logger.warning(f"AI output blocked: {safety_result.label}")
-            return SafetyResult(passed=False, reason=safety_result.label)
-        
-        # 2. 检查是否包含答案而缺少讲解（反抄答案策略）
-        if self._looks_like_bare_answer(content):
-            return SafetyResult(
-                passed=True,
-                warning="BARE_ANSWER",
-                note="需要审查是否缺少讲解过程"
-            )
-        
-        return SafetyResult(passed=True)
-    
-    def _looks_like_bare_answer(self, content: str) -> bool:
-        """检测是否像纯答案输出（缺少讲解过程）"""
-        # 简单启发式：内容很短且包含数字答案模式
-        if len(content) < 50:
-            return bool(re.search(r'=\s*[\d.]+', content))
-        return False
-```
-
----
-
-## 10. 额度与限流
-
-### 10.1 AI 调用额度
-
-```python
-class QuotaService:
-    """AI调用额度管理"""
-    
-    async def check_and_deduct(self, user_id: int) -> QuotaResult:
-        """检查并扣减一次 AI 调用额度"""
-        # 1. 获取今日已用次数
-        today_key = f"quota:ai:{user_id}:{date.today().isoformat()}"
-        used = await redis.get(today_key)
-        used = int(used or 0)
-        
-        # 2. 获取用户额度上限
-        membership = await get_active_membership(user_id)
-        limit = membership.daily_ai_quota  # -1 表示无限
-        
-        if limit == -1:
-            return QuotaResult(allowed=True, remaining=-1, limit=-1)
-        
-        remaining = limit - used
-        if remaining <= 0:
-            return QuotaResult(
-                allowed=False, 
-                remaining=0, 
-                limit=limit,
-                message="今日AI问答次数已用完，升级会员可获取更多次数"
-            )
-        
-        return QuotaResult(allowed=True, remaining=remaining - 1, limit=limit)
-    
-    async def deduct(self, user_id: int):
-        """确认扣减（在AI成功生成后调用）"""
-        today_key = f"quota:ai:{user_id}:{date.today().isoformat()}"
-        await redis.incr(today_key)
-        # 设置过期时间（仅在key首次创建时）
-        await redis.expire(today_key, 86400)
-```
-
-### 10.2 接口限流
-
-| 接口 | 限流策略 |
-|------|---------|
-| `POST /ai/chat` | 同用户 10次/分钟 |
-| `POST /ai/chat/action` | 同用户 10次/分钟 |
-| `POST /ai/messages/{id}/feedback` | 同用户 30次/分钟 |
-
-```python
-# 使用 Redis 滑动窗口限流
-async def rate_limit(user_id: int, action: str, max_requests: int, window_sec: int) -> bool:
-    key = f"ratelimit:{action}:{user_id}"
-    now = time.time()
-    window_start = now - window_sec
-    
-    pipe = redis.pipeline()
-    pipe.zremrangebyscore(key, 0, window_start)
-    pipe.zadd(key, {str(now): now})
-    pipe.zcard(key)
-    pipe.expire(key, window_sec)
-    results = await pipe.execute()
-    
-    count = results[2]
-    return count <= max_requests
-```
-
----
-
-## 11. 模型降级与容错
-
-### 11.1 降级策略
-
-```python
-class LLMClient:
-    """大模型调用客户端，带降级和重试"""
-    
-    async def stream(self, model: str, messages: list, **kwargs) -> AsyncStream:
-        try:
-            return await self._call_model(model, messages, stream=True, **kwargs)
-        except (TimeoutError, ConnectionError) as e:
-            logger.warning(f"Model {model} failed: {e}, trying fallback")
-            return await self._fallback(model, messages, **kwargs)
-    
-    async def _fallback(self, failed_model: str, messages: list, **kwargs) -> AsyncStream:
-        """模型降级：按降级链尝试备选模型"""
-        fallbacks = FALLBACK_CHAIN.get(failed_model, [])
-        for fb_model in fallbacks:
+class RetryStrategy:
+    def __init__(self):
+        self.max_retries = 3
+        self.retryable_errors = [
+            "timeout",
+            "rate_limit_exceeded",
+            "service_unavailable"
+        ]
+        self.backoff_factor = 2  # 指数退避
+
+    async def execute_with_retry(self, func, *args, **kwargs):
+        last_error = None
+
+        for attempt in range(self.max_retries):
             try:
-                logger.info(f"Trying fallback model: {fb_model}")
-                return await self._call_model(fb_model, messages, stream=True, **kwargs)
+                return await func(*args, **kwargs)
             except Exception as e:
-                logger.warning(f"Fallback {fb_model} also failed: {e}")
-                continue
-        
-        # 所有模型都不可用
-        raise AIServiceUnavailableError("所有模型暂时不可用，请稍后重试")
+                last_error = e
+
+                if not self.is_retryable(e):
+                    break
+
+                if attempt < self.max_retries - 1:
+                    wait_time = self.backoff_factor ** attempt
+                    await asyncio.sleep(wait_time)
+
+        raise last_error
+
+    def is_retryable(self, error: Exception) -> bool:
+        error_type = type(error).__name__.lower()
+        return any(err in error_type for err in self.retryable_errors)
 ```
 
-### 11.2 超时配置
+### 6.3 降级策略
 
 ```python
-MODEL_TIMEOUT_CONFIG = {
-    "glm-5":          {"connect": 5, "read": 30, "total": 45},
-    "deepseek-r1":    {"connect": 5, "read": 60, "total": 90},  # 推理模型可能更慢
-    "gpt-4o":         {"connect": 5, "read": 30, "total": 45},
-    "gpt-4o-mini":    {"connect": 5, "read": 15, "total": 25},
-}
+class FallbackStrategy:
+    async def call_ai_with_fallback(self, prompt_context: PromptContext):
+        # 主模型
+        primary_model = "gpt-4"
+        fallback_models = ["gpt-3.5-turbo", "claude-3"]
+
+        models = [primary_model] + fallback_models
+
+        for model in models:
+            try:
+                result = await call_ai_model(prompt_context, model_id=model)
+                if self.validate_response(result):
+                    return result
+            except Exception as e:
+                logger.warning(f"Model {model} failed: {e}")
+                continue
+
+        # 所有模型都失败，返回默认回复
+        return self.get_fallback_response()
 ```
 
----
+## 7. 性能优化策略
 
-## 12. 错误处理
+### 7.1 缓存策略
 
-### 12.1 错误码
+#### 7.1.1 会话上下文缓存
+- **缓存对象:** 活跃会话的上下文信息
+- **缓存键:** `ai:session:{session_id}:context`
+- **TTL:** 1小时（有活动时自动续期）
+- **更新策略:** 每次发送消息后更新
+- **淘汰策略:** LRU
 
-| 错误码 | 含义 | HTTP状态码 | 客户端行为 |
-|--------|------|-----------|-----------|
-| 30001 | AI 额度已用完 | 403 | 弹出升级引导 |
-| 30002 | AI 服务暂不可用 | 503 | 提示稍后重试 |
-| 30003 | 内容安全过滤 | 200 | 显示安全提示 |
-| 30004 | 对话不存在 | 404 | 返回对话列表 |
-| 30005 | 消息超长 | 400 | 提示缩短问题 |
-| 30006 | 请求频率过高 | 429 | 倒计时提示 |
-| 30007 | 模型响应超时 | 504 | 自动重试1次 |
+#### 7.1.2 Prompt模板缓存
+- **缓存对象:** 活跃的Prompt模板
+- **缓存键:** `ai:prompt:template:{template_code}`
+- **TTL:** 30分钟
+- **失效策略:** 模板更新后主动失效
 
-### 12.2 客户端错误处理
+#### 7.1.3 向量检索缓存
+- **缓存对象:** 相似查询的检索结果
+- **缓存键:** `ai:rag:cache:{query_hash}`
+- **TTL:** 5分钟
+- **命中率:** 预期 > 30%
 
-```dart
-// Flutter 错误处理示例
-Future<void> handleChatError(ChatError error) async {
-  switch (error.code) {
-    case 30001: // 额度用完
-      showUpgradeDialog(
-        title: "今日问答次数已用完",
-        subtitle: "升级会员可获得更多次数",
-      );
-    case 30002: // 服务不可用
-      showSnackBar("AI助手暂时开小差了，请稍后再试");
-    case 30007: // 超时
-      showSnackBar("回答生成中，请稍等...");
-      await Future.delayed(Duration(seconds: 2));
-      retryLastRequest(); // 自动重试
-    default:
-      showSnackBar("出了点问题，请重试");
+### 7.2 并发控制
+
+```python
+class ConcurrencyController:
+    def __init__(self):
+        self.semaphore = asyncio.Semaphore(100)  # 最大并发数
+        self.queue = asyncio.Queue(maxsize=1000)  # 请求队列
+
+    async def process_request(self, request):
+        # 获取信号量，控制并发数
+        async with self.semaphore:
+            try:
+                return await self._process(request)
+            except Exception as e:
+                logger.error(f"Request failed: {e}")
+                raise
+
+    async def _process(self, request):
+        # 实际处理逻辑
+        ...
+```
+
+### 7.3 批量处理优化
+
+对于高频操作，采用批量处理：
+
+```python
+async def batch_save_messages(messages: List[Message]):
+    # 使用批量插入
+    await batch_insert(ai_message, messages)
+
+    # 批量更新统计
+    await batch_update_conversation_stats(
+        [msg.conversation_id for msg in messages]
+    )
+```
+
+## 8. 安全与合规
+
+### 8.1 内容安全过滤
+
+```python
+class ContentSafetyFilter:
+    def __init__(self):
+        # 敏感词列表
+        self.sensitive_words = self._load_sensitive_words()
+
+        # 正则表达式规则
+        self.patterns = [
+            r'\b暴力\b',
+            r'\b赌博\b',
+            # ... 更多规则
+        ]
+
+    async def check(self, content: str) -> SafetyCheckResult:
+        # 1. 敏感词检测
+        word_hits = self._check_sensitive_words(content)
+        if word_hits:
+            return SafetyCheckResult(
+                is_safe=False,
+                reason=f"包含敏感词: {', '.join(word_hits)}",
+                category="sensitive_word"
+            )
+
+        # 2. 调用第三方内容审核API
+        api_result = await self._call_safety_api(content)
+        if not api_result.is_safe:
+            return api_result
+
+        # 3. 特殊场景检测
+        if self._detect_inappropriate_scenario(content):
+            return SafetyCheckResult(
+                is_safe=False,
+                reason="包含不适宜内容",
+                category="inappropriate"
+            )
+
+        return SafetyCheckResult(is_safe=True)
+```
+
+### 8.2 用户限流
+
+```python
+class RateLimiter:
+    async def check_and_consume(self, user_id: int) -> RateLimitResult:
+        today = datetime.now().strftime("%Y-%m-%d")
+        key = f"ai:rate_limit:{user_id}:{today}"
+
+        # 获取当前使用量
+        usage = await redis.hgetall(key)
+
+        # 获取用户限额（基于会员等级）
+        limit = await self._get_user_limit(user_id)
+
+        # 检查是否超限
+        if usage.get('count', 0) >= limit['max_questions']:
+            return RateLimitResult(
+                allowed=False,
+                remaining=0,
+                reset_at=self._get_reset_time()
+            )
+
+        # 增加计数
+        await redis.hincrby(key, 'count', 1)
+        await redis.hincrby(key, 'tokens', estimated_tokens)
+
+        return RateLimitResult(
+            allowed=True,
+            remaining=limit['max_questions'] - usage['count'] - 1,
+            reset_at=self._get_reset_time()
+        )
+```
+
+### 8.3 数据脱敏
+
+```python
+def mask_sensitive_data(data: dict) -> dict:
+    """脱敏敏感数据"""
+    masked = data.copy()
+
+    # 手机号脱敏
+    if 'phone' in masked:
+        masked['phone'] = mask_phone(masked['phone'])
+
+    # 姓名脱敏
+    if 'real_name' in masked:
+        masked['real_name'] = mask_name(masked['real_name'])
+
+    return masked
+```
+
+## 9. 监控与告警
+
+### 9.1 关键指标监控
+
+| 指标 | 类型 | 阈值 | 告警级别 |
+|------|------|------|---------|
+| 平均响应时间 | Gauge | > 3s | Warning |
+| P99响应时间 | Gauge | > 10s | Critical |
+| 请求成功率 | Counter | < 95% | Critical |
+| 模型调用失败率 | Counter | > 5% | Warning |
+| 内容安全拦截率 | Counter | > 10% | Info |
+| Token消耗速率 | Counter | 异常波动 | Warning |
+
+### 9.2 日志规范
+
+```python
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 结构化日志
+logger.info(
+    "ai_message_processed",
+    extra={
+        "user_id": user_id,
+        "session_id": session_id,
+        "message_id": message_id,
+        "model_id": model_id,
+        "tokens": tokens,
+        "latency_ms": latency,
+        "success": True
+    }
+)
+```
+
+## 10. 关键代码示例
+
+### 10.1 消息处理服务
+
+```typescript
+// services/ai-message.service.ts
+export class AIMessageService {
+  constructor(
+    private readonly redis: Redis,
+    private readonly db: Database,
+    private readonly aiClient: AIClient,
+    private readonly safetyFilter: ContentSafetyFilter
+  ) {}
+
+  async processMessage(
+    userId: number,
+    sessionId: string,
+    request: SendMessageRequest
+  ): Promise<SendMessageResponse> {
+    // 1. 限流检查
+    await this.checkRateLimit(userId);
+
+    // 2. 安全审核
+    const safetyResult = await this.safetyFilter.check(request.textContent);
+    if (!safetyResult.isSafe) {
+      throw new ContentSafetyError(safetyResult.reason);
+    }
+
+    // 3. 获取会话上下文
+    const context = await this.getConversationContext(sessionId);
+
+    // 4. 保存用户消息
+    const userMessage = await this.saveUserMessage(sessionId, request);
+
+    // 5. 构建Prompt
+    const promptContext = await this.buildPromptContext(userId, sessionId, request, context);
+
+    // 6. 调用AI
+    const aiResponse = await this.aiClient.generate(promptContext);
+
+    // 7. 后处理
+    const processed = await this.postProcess(aiResponse, context);
+
+    // 8. 保存AI回复
+    const aiMessage = await this.saveAIMessage(sessionId, processed, aiResponse);
+
+    // 9. 更新缓存
+    await this.updateSessionCache(sessionId, aiMessage);
+
+    return {
+      messageId: aiMessage.id,
+      textContent: processed.content,
+      knowledgePoints: processed.knowledgePoints,
+      ragSources: processed.ragSources,
+      tokens: {
+        input: aiResponse.inputTokens,
+        output: aiResponse.outputTokens
+      },
+      latency: aiResponse.latency
+    };
+  }
+
+  private async buildPromptContext(
+    userId: number,
+    sessionId: string,
+    request: SendMessageRequest,
+    context: ConversationContext
+  ): Promise<PromptContext> {
+    // 获取用户画像
+    const userProfile = await this.getUserProfile(userId);
+
+    // 选择模板
+    const template = await this.selectTemplate(context);
+
+    // RAG检索
+    const ragResults = template.enableRag
+      ? await this.ragRetrieve(request.textContent, context)
+      : [];
+
+    // 获取历史
+    const history = await this.getRecentHistory(sessionId, template.historyWindow);
+
+    // 构建变量
+    const variables = {
+      userName: userProfile.nickname || '同学',
+      gradeLevel: context.gradeLevel,
+      subjectName: context.subjectName,
+      question: request.textContent,
+      knowledgePoints: ragResults.map(r => r.content).join('\n'),
+      history: this.formatHistory(history),
+      currentDate: new Date().toISOString().split('T')[0]
+    };
+
+    return {
+      systemPrompt: this.renderTemplate(template.systemPrompt, variables),
+      userPrompt: this.renderTemplate(template.templateContent, variables),
+      ragSources: ragResults,
+      variables
+    };
   }
 }
 ```
 
----
+### 10.2 流式响应处理器
 
-## 13. 状态流转
+```typescript
+// services/stream-processor.service.ts
+export class StreamProcessor {
+  private activeStreams = new Map<string, AbortController>();
 
-### 13.1 对话生命周期
+  async processStream(
+    sessionId: string,
+    promptContext: PromptContext,
+    onChunk: (chunk: StreamChunk) => void,
+    onComplete: (messageId: number) => void,
+    onError: (error: Error) => void
+  ): Promise<void> {
+    const controller = new AbortController();
+    this.activeStreams.set(sessionId, controller);
 
-```
-[用户发送第一条消息]
-    ↓
-[创建 conversation] → status=1(活跃)
-    ↓
-[多轮对话] → message_count++
-    ↓
-[用户主动删除] → status=0(已删除)
-    或
-[30天无活动] → status=2(已归档) → 归档后90天 → 可清理存储
-```
+    try {
+      const stream = await this.aiClient.streamGenerate(promptContext, {
+        signal: controller.signal
+      });
 
-### 13.2 单次 AI 生成流程状态
+      let accumulated = '';
 
-```
-[请求进入]
-    ↓
-额度检查 ─── 额度不足 → 返回 30001
-    ↓ 通过
-安全检查 ─── 不通过 → 返回 30003
-    ↓ 通过
-上下文构建
-    ↓
-模型调用 ─── 超时 → 降级到备选模型 ─── 全部超时 → 返回 30002
-    ↓ 成功                         ↓ 成功
-流式输出 ←───────────────────────────┘
-    ↓
-后处理（知识点提取、元数据）
-    ↓
-存储 + 扣额度
-    ↓
-[完成]
-```
+      for await (const chunk of stream) {
+        if (this.isStopped(sessionId)) {
+          break;
+        }
 
----
+        accumulated += chunk.content;
 
-## 14. 监控与质量保障
+        onChunk({
+          content: chunk.content,
+          isComplete: chunk.isComplete,
+          tokens: chunk.tokens,
+          isFirst: chunk.isFirst,
+          isLast: chunk.isLast
+        });
+      }
 
-### 14.1 核心监控指标
+      // 保存完整消息
+      const messageId = await this.saveMessage(sessionId, accumulated);
+      onComplete(messageId);
 
-| 指标 | 含义 | 告警阈值 |
-|------|------|---------|
-| `ai.chat.latency_p50` | 首 token 延迟 P50 | > 5s |
-| `ai.chat.latency_p99` | 首 token 延迟 P99 | > 15s |
-| `ai.chat.error_rate` | 调用失败率 | > 5% |
-| `ai.chat.fallback_rate` | 降级触发率 | > 20% |
-| `ai.safety.block_rate` | 安全过滤率 | > 10% 需人工审查 |
-| `ai.chat.user_rating_avg` | 用户平均评分 | < 3.0 |
-| `ai.chat.token_cost_daily` | 每日 token 消耗 | 预算的 80% |
-| `ai.rag.hit_rate` | RAG 检索命中率 | < 30% 需优化知识库 |
-
-### 14.2 质量回流机制
-
-```
-用户标记"回答有误" (rating=1)
-    ↓
-写入 ai_message_feedback 队列
-    ↓
-运营/教研定期审查
-    ↓
-┌─── 知识库有误 → 更新知识库内容
-├─── Prompt 不当 → 优化 Prompt 模板
-├─── 模型能力不足 → 切换/升级模型
-└─── RAG 检索不准 → 优化向量/标签
-```
-
----
-
-## 15. 与其他模块的交互
-
-### 15.1 依赖关系
-
-```
-AI智能辅导
-    ├── ← 用户账号体系（用户信息、学生档案、会员额度）
-    ├── ← 内容服务（教材章节、知识点、题库）
-    ├── ← 错题服务（加入错题本操作）
-    └── → 学情分析（学习行为记录）
-```
-
-### 15.2 学习行为事件
-
-每次 AI 对话完成后，向学情分析模块发送学习事件：
-
-```python
-async def record_learning_event(user_id: int, event_type: str, data: dict):
-    event = {
-        "user_id": user_id,
-        "event_type": "ai_chat",       # 事件类型
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "subject": data["subject"],     # 学科
-        "duration_sec": data["duration"],  # 对话耗时
-        "knowledge_points": data["knowledge_points"],  # 涉及的知识点
-        "message_count": data["message_count"],  # 本次会话消息数
-        "model_used": data["model"],    # 使用的模型
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        logger.info(`Stream aborted for session: ${sessionId}`);
+      } else {
+        logger.error(`Stream error: ${error}`);
+        onError(error);
+      }
+    } finally {
+      this.activeStreams.delete(sessionId);
     }
-    # 发送到消息队列（Kafka/RabbitMQ）
-    await mq.publish("learning_events", event)
+  }
+
+  stopStream(sessionId: string): void {
+    const controller = this.activeStreams.get(sessionId);
+    if (controller) {
+      controller.abort();
+      logger.info(`Stream stopped: ${sessionId}`);
+    }
+  }
+
+  private isStopped(sessionId: string): boolean {
+    return this.activeStreams.has(sessionId) === false;
+  }
+}
 ```
+
+## 11. 部署与运维
+
+### 11.1 环境配置
+
+```yaml
+# config/ai-service.yaml
+ai:
+  models:
+    primary:
+      provider: openai
+      model_id: gpt-4
+      api_key: ${OPENAI_API_KEY}
+      base_url: ${OPENAI_BASE_URL}
+
+    fallback:
+      provider: openai
+      model_id: gpt-3.5-turbo
+      api_key: ${OPENAI_API_KEY}
+
+  rag:
+    enabled: true
+    vector_db:
+      type: milvus
+      host: ${MILVUS_HOST}
+      port: ${MILVUS_PORT}
+      collection: knowledge_points
+
+    embedding:
+      model: text-embedding-ada-002
+      dimension: 1536
+
+  safety:
+    enabled: true
+    provider: aliyun
+    api_key: ${ALIYUN_ACCESS_KEY}
+
+  limits:
+    max_concurrent: 100
+    max_tokens_per_request: 4000
+    timeout_seconds: 30
+```
+
+### 11.2 Docker部署
+
+```dockerfile
+FROM node:18-alpine
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --only=production
+
+COPY . .
+RUN npm run build
+
+EXPOSE 3000
+
+CMD ["node", "dist/main.js"]
+```
+
+```yaml
+# docker-compose.yml
+version: '3.8'
+
+services:
+  ai-service:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://user:pass@postgres:5432/primetop
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=primetop
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:
+```
+
+## 12. 测试策略
+
+### 12.1 单元测试
+
+```typescript
+// __tests__/ai-message.service.test.ts
+describe('AIMessageService', () => {
+  let service: AIMessageService;
+  let mockDb: jest.Mocked<Database>;
+  let mockAI: jest.Mocked<AIClient>;
+
+  beforeEach(() => {
+    mockDb = createMockDatabase();
+    mockAI = createMockAIClient();
+    service = new AIMessageService(mockRedis, mockDb, mockAI, mockSafety);
+  });
+
+  it('should process message successfully', async () => {
+    // Given
+    const request = {
+      role: 1,
+      content: '1+1=?'
+    };
+
+    mockAI.generate.mockResolvedValue({
+      content: '1+1=2',
+      inputTokens: 10,
+      outputTokens: 5,
+      latency: 100
+    });
+
+    // When
+    const result = await service.processMessage(123, 'sess-123', request);
+
+    // Then
+    expect(result.textContent).toBe('1+1=2');
+    expect(mockAI.generate).toHaveBeenCalled();
+  });
+
+  it('should block unsafe content', async () => {
+    // Given
+    const request = {
+      role: 1,
+      content: '如何制造炸弹'
+    };
+
+    mockSafety.check.mockResolvedValue({
+      isSafe: false,
+      reason: '包含危险内容'
+    });
+
+    // When & Then
+    await expect(
+      service.processMessage(123, 'sess-123', request)
+    ).rejects.toThrow(ContentSafetyError);
+  });
+});
+```
+
+### 12.2 集成测试
+
+```typescript
+// __tests__/integration/ai-flow.test.ts
+describe('AI Message Integration Flow', () => {
+  it('should complete full message flow', async () => {
+    // 1. Create conversation
+    const conv = await createConversation({
+      userId: 123,
+      subjectId: 1,
+      gradeLevel: '小学三年级'
+    });
+
+    // 2. Send user message
+    const response = await sendMessage({
+      sessionId: conv.sessionId,
+      textContent: '小明有5个苹果...'
+    });
+
+    // 3. Verify response
+    expect(response.messageId).toBeDefined();
+    expect(response.textContent).toContain('3个');
+
+    // 4. Check database records
+    const messages = await getMessages(conv.sessionId);
+    expect(messages).toHaveLength(2); // user + ai
+
+    // 5. Check RAG sources
+    expect(response.ragSources).toHaveLengthGreaterThan(0);
+
+    // 6. Check cache
+    const cache = await getSessionCache(conv.sessionId);
+    expect(cache.totalMessages).toBe(2);
+  });
+});
+```
+
+## 13. 迭代规划
+
+### 13.1 MVP阶段 (P0)
+- 基础文字问答
+- 简单上下文管理
+- 基础安全过滤
+- 用户限流控制
+
+### 13.2 V1.0 (P1)
+- 语音输入和输出
+- 图片输入（OCR）
+- RAG检索增强
+- 多模型切换
+- 消息反馈机制
+
+### 13.3 V1.5 (P2)
+- 流式响应
+- 知识点溯源引用
+- 个性化Prompt优化
+- 对话历史智能摘要
+- 学习建议生成
+
+### 13.4 V2.0 (P3)
+- 多模态理解
+- 视频讲解生成
+- 个性化学习路径
+- 跨会话知识关联
+- 学习效果评估
+
+## 14. 风险与应对
+
+| 风险 | 影响 | 概率 | 应对策略 |
+|------|------|------|---------|
+| AI回答不准确 | 高 | 中 | RAG增强 + 用户反馈 + 多模型复核 |
+| 成本过高 | 高 | 高 | 限额 + 缓存 + 模型分层 |
+| 响应慢 | 中 | 中 | 降级 + 缓存 + 超时控制 |
+| 内容违规 | 高 | 低 | 多重审核 + 人工抽检 |
+| 模型供应商依赖 | 高 | 低 | 多供应商 + 本地模型备份 |
+
+---
+
+**文档版本:** v1.0
+**创建日期:** 2026-06-17
+**最后更新:** 2026-06-17
+**维护人:** AI服务团队
