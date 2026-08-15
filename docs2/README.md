@@ -88,6 +88,7 @@
 - 服务端-教师班级管理与作业发布服务
 - 服务端-教师端教学仪表盘数据聚合与教学决策智能辅助引擎
 - 服务端-教师专业发展画像与教学能力成长追踪评估引擎
+- 服务端-教研协作与集体备课服务 ✅ (2026-08-15，教师域协作基建补缺：教师画像明确消费教研服务的 PEER_REVIEW_DONE/MENTORSHIP_LOGGED 事件与 peer_collaboration 三子指标（shared_resources_count/peer_review_participation/mentorship_hours）但生产侧零设计；命题蓝图审核权限表与班级管理跨班查询引用"教研组长"角色、备课辅助仅一句话提及"备课组成果共享"——组织本身无定义。本文补齐：教研组/备课组组织管理与组长交接、集体备课活动状态机（DRAFT→SCHEDULED→IN_PROGRESS→SUMMARIZING→COMPLETED→ARCHIVED）、组内共享资源池与审核回调、同行评议四类目标+量表模板化+月度防摊派配额、师徒带教双向确认与幂等带教记录、听评课五维量表与 follow-up 评议、DataScopeType=TEACHING_RESEARCH 数据范围解析器（aggregateOnly 聚合红线）、Outbox 双 Topic（复用 teacher.behavior.events 信封+tr.domain.events）、47600-47699 错误码段、15 条验收场景)
 - 服务端-教育高频问题智能问答库与预回答检索推荐引擎
 - 服务端-教育互动练习类型注册中心与练习素材配置装配引擎
 - 服务端-教育内容布鲁姆认知层级自动分类与认知深度标注引擎
