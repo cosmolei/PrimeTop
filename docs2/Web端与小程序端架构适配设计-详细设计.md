@@ -1833,7 +1833,7 @@ jobs:
           vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
           vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
           working-directory: apps/web
-``n
+```
 ### 8.3 小程序端构建与上传
 
 ```yaml
