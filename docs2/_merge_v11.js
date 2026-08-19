@@ -1,0 +1,11 @@
+const fs = require('fs');
+const p = '服务端-AI辅导对话知识点掌握度实时更新与能力维度同步引擎-详细设计.md';
+const a = fs.readFileSync(p, 'utf8');
+const b = fs.readFileSync('_v11_append.md', 'utf8');
+fs.writeFileSync(p, a.replace(/\s*$/, '') + '\n' + b.replace(/^\s*/, ''));
+const t = fs.readFileSync(p, 'utf8');
+const lines = t.split(/\r?\n/);
+const FENCE = '```';
+const fences = lines.filter(l => l.trim().startsWith(FENCE)).length;
+console.log('total_lines', lines.length, 'fences', fences, fences % 2 === 0 ? 'EVEN_OK' : 'ODD_BAD');
+console.log('last3:', JSON.stringify(lines.slice(-3)));
