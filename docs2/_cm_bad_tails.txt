@@ -1,135 +1,3 @@
-==== 服务端-学生个性化推送时间智能决策与通知触达时机优化引擎-详细设计.md | 511 lines | unclosed: ```@L448 ====
-            total_samples = alpha + beta - 2.0  # 减去先验
-            is_exploring = total_samples < self.MIN_SAMPLES_FOR_EXPLOIT
-            
-            scores.append(SlotScore(
-                slot_index=slot_idx,
-                day_of_week=dow,
-                hour=hour,
-                raw_score=sampled_rate,
-                context_adjusted=adjusted_score,
-               
-
-==== 服务端-学生考试焦虑智能识别与心理调适辅助干预引擎-详细设计.md | 511 lines | unclosed: ```@L500 ====
-  "code": 0,
-  "data": {
-    "needIntervention": true,
-    "urgency": "medium",
-    "recommendedStrategies": [
-      {
-        "strategyId": 7,
-        "strategyName": "考前策略指导",
-        "priority": 1,
-        "reason": "距考试5天，学生焦虑评
-
-==== 服务端-化学学科智能辅导引擎-详细设计.md | 525 lines | unclosed: ```@L456 ====
-          "type": "displacement",
-          "balanced": true,
-          "conditions": []
-        }
-      },
-      {
-        "stepId": 5,
-        "type": "summary",
-        "title": "知识总结",
-        "content": "本题核心知识点：\n1. 金属活动性顺序：K Ca Na Mg Al Zn **Fe** Sn Pb (H) **Cu** Hg Ag Pt Au\n2. 置换反应：A + BC …
-
-==== 服务端-教育大模型RLHF反馈数据管线与模型持续优化闭环引擎-详细设计.md | 525 lines | unclosed: ```@L511 ====
-    "status": "TRAINING",
-    "progress": 0.45,
-    "current_epoch": 2,
-    "total_epochs": 3,
-    "current_step": 1350,
-    "total_steps": 3000,
-    "latest_metrics": {
-      "loss": 0.234,
-      "rewards/accuracies": 0.78,
-      "rewards/margins": 1.23
-
-==== 服务端-教育平台学习策略智能编排引擎-详细设计.md | 532 lines | unclosed: ```@L518 ====
-  │
-  ├─→ 2. 加载知识点属性
-  │     (难度, 认知层级, 前置依赖, 内容类型)
-  │
-  ├─→ 3. 规则过滤: 排除不适用的策略
-  │     (学段限制, 学科限制, 学生特征限制)
-  │
-  ├─→ 4. 候选策略评分
-  │     对每个候选策略:
-  │     - 历
-
-==== 服务端-教育内容智能查重与知识库冗余内容净化引擎-详细设计.md | 534 lines | unclosed: ```@L516 ====
-│       │           ┌─────┴──────┐      ┌──────┴───────┐     │
-│       │           │  匹配片段   │      │  净化工作流   │     │
-│       │           │  定位对齐   │      │  & 审核面板   │     │
-│       │           └────────────┘      └──────────────┘     │
-│       │                                                      │
-│  ┌────┴────────────────────────────────────────────────┐   │
-│  │              触发机制                                 │   │
-│  │  ┌──────────┐  ┌────────────┐  ┌──────────────┐   │   │
-│  │  │ 增量查重  │  │ 定时全量扫描│  │ 手动触发扫描  │   │   │
-│  │  │(入库前)   │  │ (每日凌晨)  │  │ (运营后台)   │   │
-
-==== 服务端-学习会话状态快照与跨设备无缝接续恢复引擎-详细设计.md | 539 lines | unclosed: ```@L517 ====
-        "last_device_name": "张三的iPhone",
-        "last_device_type": "PHONE",
-        "last_active_at": "2026-07-07T13:25:00Z",
-        "is_current_device": false,
-        "snapshot_summary": {
-          "progress_text": "第12/25题",
-          "elapsed_text": "已用时15分50秒",
-          "has_unsaved_draft": true
-        },
-         
-
-==== 服务端-学生考试备考状态智能评估与备考节奏动态调控引擎-详细设计.md | 547 lines | unclosed: ```@L498 ====
-        "recommendedActions": [
-          "将每日学习时间回调至计划值(3.5小时)",
-          "安排1天休息日恢复精力",
-          "优先复习高性价比考点"
-        ],
-        "createdAt": "2026-04-15T08:00:00Z",
-        "status": "PENDING"
-      }
-    ],
-    "
-
-==== 服务端-学习状态实时感知与会话质量动态评估引擎-详细设计.md | 549 lines | unclosed: ```@L539 ====
-Key:   lssa:session:{sessionId}:ctx
-Type:  Hash
-TTL:   3h（会话超时自动过期）
-
-Fields:
-  studentId        → 学生ID
-  source           → 学习模式
-  currentState     → 当前状态
-  stateSince       → 当前状态开始时间
-  previou
-
-==== 服务端-学生作业全生命周期管理与智能催交提醒调度引擎-详细设计.md | 550 lines | unclosed: ```@L518 ====
-    private int concurrentAssignments;       // 当前并发作业数
-    private String loadLevel;               // LIGHT/NORMAL/HEAVY/OVERLOADED
-}
-
-/**
- * 学生活跃时段模式
- */
-public class StudentActivityPattern {
-    // 各时段活跃概率 [0-1]，基于过去30天行为统计
-    private Map<HourBucket, Double> hourlyActiveProb
-
-==== 服务端-用户学习年度回顾与成长报告生成引擎-详细设计.md | 552 lines | unclosed: ```@L537 ====
-│                   │        │ Push 推送          │
-│ 端内入口展示       │        │ · 标题：你的2026   │
-│ · 首页Banner      │        │ · 副标题：点击查看  │
-│ · 消息中心        │        │ · 深链接直达       │
-│                   │        │                   │
-│ 监控指标           │        │ 端内全量展示       │
-│ · 打开率           │        │ · 首页弹窗        │
-│ · 分享率           │        │ · 首页Banner      │
-│ · 崩溃率           │        │ · 底部Tab角标     │
-│ · 加载时长         │        │ · 消息中心      
-
 ==== 服务端-统一通知消息模板引擎与多渠道内容适配渲染服务-详细设计.md | 553 lines | unclosed: ```@L551 ====
 | `mask` | 脱敏处理 | `{{phone \| mask}}` → `138****5678` |
 | `pluralize(single, plural)` | 复数化 | `{{count}}个{{unit \| pluralize("任务", "任务")}}` |
@@ -153,18 +21,6 @@ public class StudentActivityPattern {
 ```
 POST /coupons/batches/:id/distribute    # 发放到指定用户群
 POST /coupons/batches/:id/disable       |
-
-==== 客户端-学科工具箱与参考资料速查页面架构与交互设计.md | 559 lines | unclosed: ```@L533 ====
-│  └──────┘  └──────┘  └──────┘   │
-│                                  │
-│  ┌──────┐  ┌──────┐  ┌──────┐   │
-│  │ 🕰️   │  │ 🌍   │  │ ✍️   │   │
-│  │历史  │  │地理  │  │作文  │   │
-│  │年表  │  │知识  │  │素材  │   │
-│  └──────┘  └──────┘  └──────┘   │
-│                                  │
-├──────────────────────────────────┤
-│  ⭐ 我的收藏 (最近3条)  查看全部 >│  收藏快
 
 ==== 服务端-教育内容多模态语义对齐与跨模态智能检索推荐引擎-详细设计.md | 560 lines | unclosed: ```@L533 ====
 │    Project Align │  image_vec(768d) → aligned_vec(1024d)
@@ -237,18 +93,6 @@ POST /coupons/batches/:id/disable       |
             .collect(Collectors.toList());
     }
 }
-
-==== 客户端-作文辅导页面架构与批改交互设计-详细设计.md | 592 lines | unclosed: ```@L570 ====
-│                                  │
-│  微风拂过，花瓣像蝴蝶一样翩翩起舞。 │
-│  ─── 🟢 "比喻生动，画面感强" ───── │
-│                                  │
-│  [点击批注展开详细说明]            │
-├──────────────────────────────────┤
-│  📊 批注统计                     │
-│  优点 12处 | 问题 5处 | 建议 8处   │
-│  错别字 2处 | 标点 1处 | 好词 6处   │
-└──────────────────────────────────┘
 
 ==== 服务端-学生解题过程分步评分与过程性评价服务-详细设计.md | 594 lines | unclosed: ```@L570 ====
 │  └─────────────┘                                                  │
@@ -466,18 +310,6 @@ POST /api/v1/incentive/rewards/ack
             params.setPromptInstructionOverride(
                 "学生表示不太明白。请用更简单
 
-==== 客户端-学生班级与作业提交页面架构与交互设计-详细设计.md | 688 lines | unclosed: ```@L670 ====
-    "submissionId": "sub_abc123",
-    "submitTime": "2026-06-13T10:45:00.000Z",
-    "gradingStatus": "teacherGraded",
-    "totalScore": 90,
-    "maxScore": 100,
-    "classAvgScore": 82.5,
-    "classRank": 8,
-    "classTotalStudents": 42,
-    "timeSpent": "3分15秒",
-    "teacherComment": "整体不错
-
 ==== 服务端-AI辅导对话嵌入式即时练习与实时理解度检测引擎-详细设计.md | 702 lines | unclosed: ```@L678 ====
         贝叶斯理解度估计
 
@@ -537,18 +369,6 @@ public class NumericVariationGenerator {
         
         # 3. 准标识符组合唯一性
         unique_qi_combos = data[self.quasi_identifiers].drop
-
-==== 客户端-学科上下文与学习环境管理-详细设计.md | 727 lines | unclosed: ```@L717 ====
-class AIConversationPage extends StatefulWidget {
-  // ...
-}
-
-class _AIConversationPageState extends State<AIConversationPage> {
-  late SubjectContext _context;
-  
-  @override
-  void initState() {
-    super.
 
 ==== 服务端-学生用户学习内容推荐候选集生成与多路召回融合引擎-详细设计.md | 747 lines | unclosed: ```@L668 ====
                     List<String> contentIds = ckpService.getContentByKnowledgePoint(
@@ -849,18 +669,6 @@ class BatchVerificationController:
       case 4: return const Color(0xFFE5E4E2); // 铂金
       case 5: return const Color(0xFFB9F2FF); // 钻石
       default: return Colors.grey
-
-==== 客户端-学习规划页面架构与任务管理交互设计-详细设计.md | 916 lines | unclosed: ```@L877 ====
-│  │  ⚠️ 二次函数掌握度偏低         │  │
-│  │               [查看目标 →]     │  │
-│  └───────────────────────────────┘  │
-│                                      │
-│  ┌─ QuickActions ─────────────────┐  │
-│  │  [+ 新目标]  [📝 生成计划]    │  │
-│  └───────────────────────────────┘  │
-│                                      │
-│  ┌─ RecentReviewSummary ──────────┐  │
-│  │  📊 上周复盘 · 完成
 
 ==== 服务端通用数据导入服务与批量操作引擎-详细设计.md | 929 lines | unclosed: ```@L779 ====
                         error_code="FIELD_REQUIRED", field_name=f,
