@@ -577,3 +577,951 @@ public class ConversationKPExtractor {
             .collect(Collectors.toList());
     }
 }
+```
+
+**提取规则说明：**
+
+| 规则 | 权重基数 | 说明 |
+|------|----------|------|
+| R1 标注复用 | 标注 relevanceScore 原值 | 主来源，标注服务已完成 NER/向量/LLM 三级识别（见其文档 Phase1-3） |
+| R2 追问暗示 | 0.6 | FOLLOW_UP 意图暗示对前述 KP 有深入需求 |
+| R3 困惑回溯 | 0.4 | CONFUSED 意图暗示前置 KP 可能缺失，补前置一层（只展开一层，防链式放大） |
+| R4 章节背景 | 0.2（putIfAbsent 不覆盖已有） | 仅作背景暴露记录，不作为掌握度评估主证据 |
+| R5 过滤阈值 | ≥0.3 | 低于 0.3 视为噪音，不进入后续计算 |
+
+> **边界裁决（F4 修复）**：标注结果中 `knowledgePointId` 在标注引擎侧为字符串型的全局编码（如 `KP-MATH-8-0123`），本引擎落库前统一解析为内部 `BIGINT` 主键；解析失败的编码记入 `kp_resolve_failures` 日志表（只记编码与出现次数，不记对话原文），每周对账回标注引擎修正。
+
+---
+
+### 4.2 Step 2: 对话交互行为特征提取
+
+#### 4.2.1 行为特征向量定义
+
+掌握度评估不只看"讲了什么"，更看"学生怎么互动的"。从对话回合中提取五维行为特征：
+
+```java
+/**
+ * 对话行为特征向量（每个知识点在整段对话上的聚合视图）
+ */
+@Data
+@Builder
+public class BehaviorFeatureVector {
+    /** 深度追问次数：同一 KP 的 FOLLOW_UP 回合数（0~N，封顶 5） */
+    private int deepFollowUpCount;
+
+    /** 提示依赖度： hintExpansionCount 合计 / 涉及回合数（0~1，越高越依赖提示） */
+    private double hintDependency;
+
+    /** 简化请求次数： userAskedSimpler + userAskedAnotherWay 合计（0~N，封顶 3） */
+    private int simplificationRequests;
+
+    /** 主动理解信号： userConfirmed（"懂了"/"明白了"类确认）次数（0~N，封顶 3） */
+    private int understandingSignals;
+
+    /** 平均响应时长比： 用户回复耗时 / 学段基准响应时长（0.5~3.0，封顶截断） */
+    private double responseTimeRatio;
+
+    /** 涉及回合数： 本 KP 被讨论的回合总数 */
+    private int turnsInvolved;
+}
+```
+
+**学段基准响应时长**（用于 responseTimeRatio 归一，来自学习行为分析引擎的学段常数表）：
+
+| 学段 | 基准时长 |
+|------|----------|
+| 小学（1-6 年级） | 45s |
+| 初中 | 30s |
+| 高中 | 25s |
+| 幼儿 | 60s |
+
+#### 4.2.2 特征计算规则
+
+| 特征 | 计算规则 | 掌握度方向 |
+|------|----------|-----------|
+| deepFollowUpCount | 同一 KP 上 FOLLOW_UP 回合计数，≥5 封顶 | 中性偏正（深入探究）但结合 simplificationRequests 判读 |
+| hintDependency | ΣhintExpansionCount / turnsInvolved | **负向**：依赖提示越高掌握越弱 |
+| simplificationRequests | "讲简单点"/"换一种讲法" 计数 | **负向**：暗示当前讲解超出其理解水平 |
+| understandingSignals | 主动确认计数 | **正向**：最强的理解证据 |
+| responseTimeRatio | 截断到 [0.5, 3.0]；幼儿段不参与计算（识字量小，时长噪音大） | 轻度负向 |
+
+```java
+@Component
+public class DialogueBehaviorAnalyzer {
+
+    /**
+     * 从对话回合中聚合每个知识点的行为特征
+     */
+    public Map<String, BehaviorFeatureVector> analyze(
+        List<WeightedKnowledgePoint> kps,
+        List<ConversationTurnSummary> turns
+    ) {
+        Map<String, BehaviorFeatureVector.BehaviorFeatureVectorBuilder> builders = new HashMap<>();
+        Map<String, Integer> turnCounts = new HashMap<>();
+
+        for (WeightedKnowledgePoint kp : kps) {
+            builders.put(kp.getKnowledgePointId(), BehaviorFeatureVector.builder());
+            turnCounts.put(kp.getKnowledgePointId(), 0);
+        }
+
+        for (ConversationTurnSummary turn : turns) {
+            for (String kpId : safe(turn.getDetectedKpIds())) {
+                BehaviorFeatureVector.BehaviorFeatureVectorBuilder b = builders.get(kpId);
+                if (b == null) continue;
+
+                turnCounts.merge(kpId, 1, Integer::sum);
+
+                if ("FOLLOW_UP".equals(turn.getUserIntent())) {
+                    b.deepFollowUpCount(acc -> Math.min(5, acc + 1));
+                }
+                if (turn.isUserAskedSimpler() || turn.isUserAskedAnotherWay()) {
+                    b.simplificationRequests(acc -> Math.min(3, acc + 1));
+                }
+                if (turn.isUserConfirmed()) {
+                    b.understandingSignals(acc -> Math.min(3, acc + 1));
+                }
+                // hintDependency 分子累计，最后统一除
+                b.hintExpansionCount(acc -> acc + Math.max(0, turn.getHintExpansionCount()));
+            }
+        }
+
+        return builders.entrySet().stream().collect(Collectors.toMap(
+            Map.Entry::getKey,
+            e -> {
+                int turns = turnCounts.get(e.getKey());
+                BehaviorFeatureVector v = e.getValue().turnsInvolved(turns).build();
+                v.setHintDependency(turns == 0 ? 0.0
+                    : Math.min(1.0, (double) v.getHintExpansionCount() / turns));
+                return v;
+            }
+        ));
+    }
+}
+```
+
+#### 4.2.3 行为分合成（-1 ~ +1）
+
+```
+behaviorScore = 0.40 * understandingSignalScore      // +1/次，封顶 +1.0
+              - 0.30 * hintDependency                 // 0 ~ -0.3
+              - 0.15 * simplificationScore            // 每次 -0.075，封顶 -0.15
+              + 0.10 * followUpPositiveScore          // 深度追问且无简化请求时 +0.1
+              - 0.05 * responseTimePenalty            // ratio>1.8 时 -0.05
+```
+
+| behaviorScore 区间 | 含义 |
+|--------------------|------|
+| [0.3, 1.0] | 对话呈现明确理解信号 |
+| [-0.1, 0.3) | 中性，主要是被动接触 |
+| [-1.0, -0.1) | 存在理解困难信号，掌握度应下调或停滞 |
+
+> **红线**：behaviorScore 只驱动**掌握度停滞或小幅下调**，不下调超过当前分的 10%（见 §4.3 幅度限制 G5）。AI 对话是辅导场景，学生提问本身不代表不会——提问是积极行为，防止"问得多=掌握差"的误判。
+
+---
+
+### 4.3 Step 3: 掌握度增量计算
+
+#### 4.3.1 增量公式
+
+```
+relevance  = Step1 得到的知识点相关性权重（0.3 ~ 1.0）
+baseGain   = 0.10 * relevance                          // 接触性基础增益
+signalGain = 0.10 * behaviorScore * relevance          // 行为信号增益（可为负）
+rawDelta   = baseGain + signalGain
+
+delta      = clamp(rawDelta, -maxDown, maxUp)          // 幅度限制见 4.3.2
+newScore   = clamp(oldScore + delta, 0.05, 1.0)        // 地板 0.05 防除零
+```
+
+**计算示例：**
+
+| 场景 | relevance | behaviorScore | oldScore | rawDelta | delta(受限后) | newScore |
+|------|-----------|---------------|----------|----------|---------------|----------|
+| 主动确认理解 | 0.9 | +0.6 | 0.40 | +0.144 | +0.144 | 0.544 |
+| 被动接触无信号 | 0.5 | 0.0 | 0.20 | +0.050 | +0.050 | 0.250 |
+| 多次要简化讲解 | 0.8 | -0.4 | 0.55 | -0.002 | -0.002 | 0.548（基本停滞） |
+| 连续困惑+高提示依赖 | 0.7 | -0.7 | 0.62 | -0.019→触发 G9 | -0.062（按 10% 上限） | 0.558 |
+
+#### 4.3.2 单次幅度限制（G5）
+
+| 当前掌握度区间 | maxUp | maxDown |
+|----------------|-------|---------|
+| [0, 0.3) | 0.15 | 0.02 |
+| [0.3, 0.6) | 0.12 | 0.04 |
+| [0.6, 0.85) | 0.08 | 0.06 |
+| [0.85, 1.0] | 0.05 | 0.08 |
+
+设计理由：
+- 低分段允许较快上升（首次学习的边际收益大），但下调极缓（防一次对话挫败就抹掉前期积累）
+- 高分段上升放缓（接近掌握需要练习与考试渠道的证据交叉确认，AI 对话单渠道不足以推到 MASTER）
+- **上限约束**：AI 对话渠道单独能将 KP 推到的最高分为 0.85（APPLY 顶）；0.85→MASTER 必须由练习/考试渠道信号经融合引擎加权达成（对齐融合引擎渠道权重表 `ai_dialogue` 权重 0.10 的口径）
+
+#### 4.3.3 置信度计算
+
+```
+confidence = min(1.0,
+      0.35 * relevance
+    + 0.25 * min(1.0, turnsInvolved / 3.0)      // 讨论回合数越多越可信
+    + 0.20 * signalClarity)                      // 信号明确度：正负信号是否存在其一
+    + 0.20 * historyConsistency)                 // 历史一致性：近 3 次评估方向是否一致
+```
+
+- `signalClarity`：behaviorScore ∈ [-0.1, 0.1] 无明确信号 → 0.3；否则 → 1.0
+- `historyConsistency`：与近 3 次变更方向一致比例（首次评估取 0.5）
+- 置信度 < 0.35 的评估**照常落库但标记 low_confidence=1**，不参与能力维度聚合（G12 联动）
+
+```java
+@Component
+public class MasteryDeltaCalculator {
+
+    private static final BigDecimal DIALOGUE_CHANNEL_CAP = new BigDecimal("0.85");
+
+    public KPDelta calculate(
+        WeightedKnowledgePoint kp,
+        BehaviorFeatureVector behavior,
+        StudentKPMastery current,
+        List<MasteryChangeLog> recentHistory
+    ) {
+        double relevance = kp.getWeight();
+        double behaviorScore = BehaviorScorer.score(behavior);
+
+        double baseGain = 0.10 * relevance;
+        double signalGain = 0.10 * behaviorScore * relevance;
+        double rawDelta = baseGain + signalGain;
+
+        double old = current == null ? 0.0 : current.getMasteryScore().doubleValue();
+        double[] limits = amplitudeLimits(old);
+        double delta = Math.max(-limits[1], Math.min(limits[0], rawDelta));
+
+        double newScore = Math.max(0.05, Math.min(1.0, old + delta));
+        // 渠道上限：AI 对话单独不可推过 0.85
+        newScore = Math.min(newScore, DIALOGUE_CHANNEL_CAP.doubleValue());
+
+        double confidence = computeConfidence(kp, behavior, recentHistory);
+
+        return KPDelta.builder()
+            .knowledgePointId(kp.getKnowledgePointId())
+            .oldScore(BigDecimal.valueOf(old).setScale(4, RoundingMode.HALF_UP))
+            .newScore(BigDecimal.valueOf(newScore).setScale(4, RoundingMode.HALF_UP))
+            .delta(BigDecimal.valueOf(newScore - old).setScale(4, RoundingMode.HALF_UP))
+            .confidence(BigDecimal.valueOf(confidence).setScale(4, RoundingMode.HALF_UP))
+            .lowConfidence(confidence < 0.35)
+            .build();
+    }
+
+    private double[] amplitudeLimits(double current) {
+        if (current < 0.3) return new double[]{0.15, 0.02};
+        if (current < 0.6) return new double[]{0.12, 0.04};
+        if (current < 0.85) return new double[]{0.08, 0.06};
+        return new double[]{0.05, 0.08};
+    }
+}
+```
+
+---
+
+### 4.4 Step 4: 掌握度持久化与变更记录
+
+#### 4.4.1 事务边界（G7/G8）
+
+```
+同一本地事务内完成：
+  1. UPDATE student_kp_mastery      （乐观锁 version CAS，命中 uk_student_kp）
+  2. INSERT mastery_change_log      （幂等键 uk_idempotent，冲突→整段回滚转幂等回放）
+  3. INSERT aim_outbox              （下游事件，Relay 异步投递）
+
+任一失败 → 全部回滚，消费位点不推进，Kafka 重投（消费端幂等由 uk_idempotent 兜底）
+```
+
+#### 4.4.2 并发控制
+
+| 场景 | 控制手段 | 裁决 |
+|------|----------|------|
+| 同学生同 KP 的两次评估并发 | Redis 锁 `aim:lock:{studentId}:{kpId}`，waitTime=0，失败延迟 3s 重投（≤3 次） | 后到者基于先到者的新值重算 |
+| DB 层最终防线 | `version` 乐观锁，CAS 失败重读重算（上限 2 次，之后转延迟重投） | 防 Redis 锁失效窗口 |
+| 幂等回放 | `uk_idempotent = source_type:source_id:kp_id` 命中 → 直接返回首次结果（200 语义码 59803） | 同键不同 payload → 拒绝并 P2 告警（数据完整性异常） |
+
+```java
+@Service
+public class MasteryPersistenceService {
+
+    @Transactional
+    public KPMasteryChange persist(
+        Long studentId, KPDelta delta, EvaluationSource source, String evidenceJson
+    ) {
+        String idemKey = source.getType() + ":" + source.getId() + ":" + delta.getKnowledgePointId();
+
+        // 幂等短路：已评估过直接回放首次结果
+        masteryChangeLogRepository.findByIdempotentKey(idemKey).ifPresent(existing -> {
+            throw new IdempotentReplayException(existing);   // 全局异常处理器转 59803 + 首次结果
+        });
+
+        StudentKPMastery current = masteryRepository
+            .findByStudentIdAndKnowledgePointIdForUpdate(studentId, delta.getKnowledgePointId())
+            .orElseGet(() -> StudentKPMastery.initNew(studentId, delta.getKnowledgePointId()));
+
+        int oldLevel = MasteryLevel.fromScore(current.getMasteryScore()).getValue();
+        int newLevel = MasteryLevel.fromScore(delta.getNewScore()).getValue();
+
+        // G4/G9 等级迟滞：降级需连续两次低评估，升级即时生效
+        boolean downgradeBlocked = newLevel < oldLevel && !current.isPrevAssessmentWeak();
+        if (downgradeBlocked) {
+            current.setPrevAssessmentWeak(true);      // 标记一次弱评估，本次不降
+            current.setAssessmentCountSinceChange(current.getAssessmentCountSinceChange() + 1);
+        } else {
+            current.applyDelta(delta);
+            current.setPrevAssessmentWeak(newLevel < oldLevel);
+        }
+        current.setVersion(current.getVersion() + 1);
+
+        masteryRepository.save(current);
+
+        MasteryChangeLog log = MasteryChangeLog.builder()
+            .studentId(studentId)
+            .knowledgePointId(delta.getKnowledgePointId())
+            .sourceType(source.getType())
+            .sourceId(source.getId())
+            .oldScore(delta.getOldScore())
+            .newScore(downgradeBlocked ? delta.getOldScore() : delta.getNewScore())
+            .scoreDelta(downgradeBlocked ? BigDecimal.ZERO : delta.getDelta())
+            .oldLevel(oldLevel)
+            .newLevel(downgradeBlocked ? oldLevel : newLevel)
+            .levelChanged(!downgradeBlocked && oldLevel != newLevel)
+            .evidenceJson(evidenceJson)
+            .confidence(delta.getConfidence())
+            .idempotentKey(idemKey)
+            .lowConfidence(delta.isLowConfidence())
+            .downgradeDeferred(downgradeBlocked)
+            .build();
+        changeLogRepository.save(log);
+
+        // Outbox 同事务（G8）：下游事件在 §4.6 定义
+        outboxRepository.saveAll(buildOutboxEvents(current, log));
+
+        return KPMasteryChange.from(current, log, delta);
+    }
+}
+```
+
+#### 4.4.3 DDL 增补（v1.1）
+
+v1.0 §2.3 的 `mastery_change_log` 增补三列与分区策略：
+
+```sql
+ALTER TABLE mastery_change_log
+    ADD COLUMN low_confidence    TINYINT(1) NOT NULL DEFAULT 0 COMMENT '低置信度标记 confidence<0.35',
+    ADD COLUMN downgrade_deferred TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'G9 迟滞：本次降级被推迟',
+    ADD COLUMN month_bucket      CHAR(7) GENERATED ALWAYS AS (DATE_FORMAT(created_at, '%Y-%m')) STORED,
+    ADD INDEX idx_month_student (month_bucket, student_id);
+
+-- 月分区滚动：在线保留 6 个月，历史归档 ClickHouse（TTL 3 年）
+-- DAU50 万 × 日均 240 万行 ≈ 月 7200 万行，MySQL 仅留当月+前 5 月
+```
+
+`student_kp_mastery` 增补评估连续性字段：
+
+```sql
+ALTER TABLE student_kp_mastery
+    ADD COLUMN prev_assessment_weak TINYINT(1) NOT NULL DEFAULT 0 COMMENT 'G9 前一次评估是否偏弱',
+    ADD COLUMN assessment_count_since_change INT NOT NULL DEFAULT 0 COMMENT '等级未变以来的评估次数';
+```
+
+---
+
+### 4.5 Step 5: 能力维度聚合更新
+
+#### 4.5.1 权威边界（F2 修复）
+
+| 存储 | 归属 | 说明 |
+|------|------|------|
+| `user_ability_profiles` | **用户学习画像与能力维度模型服务** | 能力雷达的**跨渠道权威 SSOT**，多端展示唯一取数源 |
+| 本文档 `student_ability_dimension` | 本引擎 | **AI 对话渠道的能力维度投影**（渠道视图，仅供画像服务融合取数与渠道内解释），不直接对前端暴露 |
+
+本引擎的聚合更新策略：**增量触发 + 事件供数**。KP 掌握度变化满足触发条件（G12）时重算受影响维度，结果双写：
+1. 写本地 `student_ability_dimension`（渠道投影，同事务）
+2. Outbox 发布 `ai_dialogue.ability_updated`，**用户学习画像服务消费后按其自身权重合入 `user_ability_profiles`**（融合权重归画像服务定义，本引擎不裁定）
+
+#### 4.5.2 增量聚合公式
+
+```
+对能力维度 d：
+贡献集 Kd = { 本学生已评估 KP ∧ kp_ability_weight(kp, d) 存在 ∧ confidence ≥ 0.35 }
+
+abilityScore(d) = Σ(kp.masteryScore × w_kd) / Σ(w_kd)        其中 w_kd = kp_ability_weight(kp, d).weight
+
+增量式：仅当某 KP 的 masteryScore 变化 Δ 时
+  abilityScore(d) += Δ × w_kd / Σ(w_kd)
+```
+
+**触发条件（G12 节流）**：仅当 `levelChanged=true` 或 `|delta| ≥ 0.10` 或该维度距上次重算 > 7 天时重算；其余小变化只累计 `pending_delta`，凑满 0.10 再触发。能力维度重算频率上限：每学生每日每维度 ≤ 4 次。
+
+```java
+@Component
+public class AbilityDimensionAggregator {
+
+    public List<AbilityDimensionChange> aggregate(
+        Long studentId, KPMasteryChange kpChange, Map<String, BigDecimal> dimensionWeights
+    ) {
+        if (kpChange.isLowConfidence()) return List.of();   // 低置信度不入聚合
+
+        List<AbilityDimensionChange> changes = new ArrayList<>();
+        for (Map.Entry<String, BigDecimal> e : dimensionWeights.entrySet()) {
+            String dimension = e.getKey();
+            BigDecimal w = e.getValue();
+
+            StudentAbilityDimension dim = abilityRepository
+                .findByStudentIdAndDimension(studentId, dimension)
+                .orElseGet(() -> StudentAbilityDimension.init(studentId, dimension));
+
+            // 增量化：Δ × w / Σw（Σw 以投影表当前贡献集总权重缓存为准，每日 04:20 全量校准）
+            double totalWeight = dim.getCachedTotalWeight();
+            double increment = kpChange.getDelta().doubleValue() * w.doubleValue() / totalWeight;
+            double newScore = clamp(dim.getAbilityScore().doubleValue() + increment, 0.05, 1.0);
+
+            dim.setAbilityScore(BigDecimal.valueOf(newScore).setScale(4, RoundingMode.HALF_UP));
+            dim.setContributingKpCount(dim.getContributingKpCount() + (dim.isNewlyContributing() ? 1 : 0));
+            dim.setPendingDelta(0.0);
+            dim.setVersion(dim.getVersion() + 1);
+            abilityRepository.save(dim);
+
+            changes.add(AbilityDimensionChange.builder()
+                .dimension(dimension)
+                .oldScore(dim.getAbilityScoreBefore())
+                .newScore(dim.getAbilityScore())
+                .delta(BigDecimal.valueOf(increment))
+                .build());
+        }
+        return changes;
+    }
+}
+```
+
+#### 4.5.3 每日全量校准
+
+04:30 定时任务（分 16 片按 student_id 哈希扫描）：对昨日有变更的学生**全量重算**能力维度（非增量），消除增量舍入漂移；校准前后差异 > 0.02 记入校准日志并告警漂移率 > 1%。
+
+---
+
+### 4.6 Step 6: 下游事件分发
+
+#### 4.6.1 Outbox 表
+
+```sql
+CREATE TABLE aim_outbox (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    event_id        VARCHAR(64) NOT NULL COMMENT '全局唯一事件ID: aim-{snowflake}',
+    topic           VARCHAR(64) NOT NULL COMMENT '目标topic: primetop.ai.events',
+    event_type      VARCHAR(64) NOT NULL COMMENT '事件类型, 见 4.6.2',
+    aggregate_id    VARCHAR(64) NOT NULL COMMENT '聚合根: {studentId}:{kpId} 或 {studentId}',
+    payload         JSON NOT NULL,
+    occurred_at     DATETIME NOT NULL,
+    published_at    DATETIME COMMENT 'Relay投递成功时间',
+    publish_status  TINYINT NOT NULL DEFAULT 0 COMMENT '0待发 1成功 2失败',
+    retry_count     INT NOT NULL DEFAULT 0,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uk_event_id (event_id),
+    INDEX idx_status_created (publish_status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI掌握度引擎Outbox';
+```
+
+#### 4.6.2 事件清单与消费方矩阵
+
+| 事件 | Topic | 关键载荷 | 消费方 | 消费方幂等键 |
+|------|-------|----------|--------|--------------|
+| `ai_dialogue.assessed` | primetop.ai.events | MasterySignal（channel=ai_dialogue，selfConfidence 必填，evidence 脱敏） | **融合引擎 UMFE** | eventId → mastery_signal_inbox |
+| `ai_dialogue.ability_updated` | primetop.ai.events | {studentId, dimension, score, confidence, contributingKpCount} | 用户学习画像服务 | eventId |
+| `ai_dialogue.mastery_changed` | primetop.ai.events | {studentId, kpId, oldLevel, newLevel, levelChanged, lowConfidence} | 学情报告缓存失效/推荐引擎增量刷新 | (eventId) |
+| `ai_dialogue.weak_kp_detected` | primetop.ai.events | {studentId, kpId, score, confidence, evidenceSummary} | **间隔重复复习引擎**（注册 KNOWLEDGE_POINT 复习项，v1.1 扩展订阅） | 复习项唯一键 (user,item_type,item_source_id) |
+| `ai_dialogue.level_upgraded` | primetop.ai.events | {studentId, kpId, newLevel, kpName} | 成长激励中心（成就判定） | eventId |
+
+**`ai_dialogue.weak_kp_detected` 触发条件**：评估后 `newScore < 0.35` 且 `confidence ≥ 0.5` 且近 7 天未发过同 KP 事件（Redis `aim:weak:sent:{sid}:{kpId}` 去重）。
+
+**`weak_kp_detected` 生产者裁决（F6）**：间隔重复引擎订阅表原登记 `knowledge_point.weak_detected` 来源为"知识点体系"。裁决：KP 薄弱信号的复习项注册**允许双源**——知识点体系聚合源（跨渠道）与本引擎渠道源（AI 对话实时）并存；复习引擎以复习项唯一键兜底幂等，重复注册抛 ValueError 静默跳过（其文档 §8.3 已含该语义）。本引擎事件命名为 `ai_dialogue.weak_kp_detected` 以区分来源，复习引擎文档登记为 v1.1 扩展订阅项。
+
+#### 4.6.3 MasterySignal 载荷格式（对接融合引擎契约）
+
+```json
+{
+  "signalId": "aim-sig-01J8X4M2V0A1B2C3D4E5F6G7H8",
+  "studentId": 88001234,
+  "knowledgePointId": 9200111,
+  "channel": "ai_dialogue",
+  "rawScore": 0.5440,
+  "delta": 0.1440,
+  "selfConfidence": 0.6200,
+  "occurredAt": "2026-09-20T18:52:11+08:00",
+  "evidence": {
+    "conversationId": 7788123,
+    "triggerType": "SESSION_END",
+    "relevance": 0.9,
+    "behaviorScore": 0.6,
+    "turnsInvolved": 4,
+    "dialogueSnippetMasked": "用户确认了[一元二次方程求根公式]的理解"
+  }
+}
+```
+
+> 对齐融合引擎 §5.5 订阅表：`rawScore 按对话行为推断，selfConfidence 必填`。`evidence.dialogueSnippetMasked` 为脱敏摘要（≤50 字，不含原文），原文永不入事件（C2）。
+
+---
+
+## 5. API 接口汇总与幂等限流
+
+### 5.1 接口总表
+
+| # | 接口 | 方法/路径 | 调用方 | 幂等键 | 限流 |
+|---|------|-----------|--------|--------|------|
+| 1 | 对话评估触发 | `POST /api/internal/mastery/evaluate/conversation` | AI 对话引擎 | `conversationId+triggerType`（自然键） | 单实例 200/s，超出 429 |
+| 2 | 单点掌握度查询（代理） | `GET /api/v1/mastery/student/{sid}/knowledge-point/{kpId}` | BFF/客户端 | 读接口 | 单学生 100/s |
+| 3 | 批量掌握度查询（代理） | `POST /api/v1/mastery/student/{sid}/knowledge-points/batch` | BFF/推荐 | 读接口 | 单请求 ≤ 500 对 |
+| 4 | 能力雷达查询（代理） | `GET /api/v1/mastery/student/{sid}/ability-radar` | BFF/客户端 | 读接口 | 单学生 20/s |
+| 5 | 变更历史查询 | `GET /api/v1/mastery/student/{sid}/changes` | BFF/家长端 | 读接口 | 单学生 20/s |
+| 6 | UMFE 信号直投（备用通道） | `POST /internal/mastery/signals`（UMFE 提供，本引擎为客户端） | 本引擎 Relay | `signalId` | UMFE 侧管控 |
+| 7 | gRPC `MasteryEvaluatorService.EvaluateConversation` | gRPC | AI 对话引擎（高吞吐内部通道） | 同 #1 | 连接级背压 |
+| 8 | gRPC `GetChannelEvidence` | gRPC | AI 对话引擎（证据链回显） | 读接口 | — |
+| 9 | 管理端：会话重放 | `POST /api/admin/mastery/replay/{conversationId}` | 运营/研发 | `replayId`（双人审批 G14） | 10/min |
+| 10 | 管理端：信号重投 | `POST /api/admin/mastery/outbox/retry` | 运维 | 批任务 id | 10/min |
+| 11 | 管理端：评估审计查询 | `GET /api/admin/mastery/evaluations` | 审计 | 读接口 | 60/s |
+
+### 5.2 触发接口幂等语义
+
+- **自然幂等键**：`(conversationId, triggerType)`。同键重复提交（AI 对话引擎超时重试）直接返回首次结果，`evaluationDurationMs` 返回 0 并带 `52712 DUPLICATE_EVALUATION` 语义标记（HTTP 200，幂等吞没不报错）。
+- **并发互斥**：同键并发触发以 `mastery_eval_task` 表 `uk_conv_trigger` 抢占裁决，后到者返回 `202 Accepted + taskId` 轮询（G14 任务可重入）。
+- **触发去重与信号单发（守卫 G2/R6）**：`TURN_COMPLETE` 触发**不发布** UMFE 信号，仅更新渠道明细与变更日志；信号集合以 `SESSION_END`（或 `FEEDBACK`，source_id=feedbackId）为唯一发布源。同一会话先发 `TURN_COMPLETE` 后发 `SESSION_END` 时，前者渠道明细并入后者同事务重算，信号仍只发一次（signalId 恒定 `ai_dialogue:{conversationId}:{kpId}`）。
+- **反馈触发**：`FEEDBACK` 携带 `feedbackId`，与 `SESSION_END` 可各自独立发布（不同 source_id，互不吞没）；同一 feedbackId 重复触发幂等吞没。
+
+### 5.3 gRPC 内部接口
+
+```proto
+service MasteryEvaluatorService {
+  // 对话评估（等价 REST #1，供高吞吐内部调用）
+  rpc EvaluateConversation(EvaluateConversationRequest)
+      returns (EvaluateConversationResponse);
+  // 拉取某会话的渠道证据链（AI 对话引擎在"为什么这样评估"入口回显）
+  rpc GetChannelEvidence(EvidenceRequest) returns (EvidenceResponse);
+  // 健康与积压探针（K8s readiness 使用，见 §12）
+  rpc GetEvaluatorHealth(HealthRequest) returns (HealthResponse);
+}
+```
+
+- `EvaluateConversationRequest` 与 REST 请求体字段一一对应；响应中 `abilityChanges` 全部带 `estimated: true`（§4.5.4）。
+- `GetChannelEvidence` 只读 `mastery_change_log`（按 conversationId 过滤），**不回源对话原文**，只回 messageRefs 与 12 维行为计数（守卫 G12）。
+
+### 5.4 管理端接口
+
+| 接口 | 说明 | 关键约束 |
+|------|------|----------|
+| `POST /api/admin/mastery/replay/{conversationId}` | 重放历史会话评估 | 双人审批（G14）+ 审计日志；重放结果与历史结果差异 >0.05 时生成对账告警（§13-M8） |
+| `POST /api/admin/mastery/outbox/retry` | Outbox 死信重投 | 仅 `FAILED_RETRY/DEAD` 状态可重投；批量 ≤ 1000 条 |
+| `GET /api/admin/mastery/evaluations?status=&from=&to=` | 评估任务审计查询 | 保留 180 天（合规 C8） |
+
+### 5.5 查询接口代理化（修复 v1.0 缺陷 F3）
+
+v1.0 中 §3.3.3 四个查询接口直接读本引擎 `student_kp_mastery`，与 UMFE 权威冲突。v1.1 裁决：
+
+1. **路径保持不变**（客户端/BFF 已接入），实现改为**纯代理**：实时转发至 UMFE 查询 API / gRPC，本引擎**不读取本表充当掌握度**（守卫 G1/R11）。
+2. 响应 VO 结构（`KPMasteryDetail`/`AbilityRadarVO`）字段名不变，字段来源改标注：掌握度分/等级/decayedScore 来自 UMFE；`exposureCount`/`aiTutorCount`/`lastAiTutorAt` 来自本引擎 `student_kp_mastery`（聚合拼装，渠道证据由本引擎负责）。
+3. `recentChanges`（最近 5 次变更）来自本引擎 `mastery_change_log`（仅 AI_TUTOR 来源），其他渠道变更经 UMFE `change_log` 查询补齐。
+4. **降级红线（D8）**：UMFE 查询不可用时本接口返回 `503 + Retry-After`，**禁止**读本表兜底冒充融合掌握度。
+5. 批量接口 ≤ 500 对、P99 < 80ms 的容量契约转发 UMFE 侧承诺（UMFE §5.4 `BatchGetMastery`）。
+
+---
+
+## 6. 时序图
+
+### 6.1 SESSION_END 评估主链路
+
+```mermaid
+sequenceDiagram
+    participant AI as AI 对话引擎
+    participant EV as 评估引擎(本服务)
+    participant DB as MySQL
+    participant RD as Redis
+    participant OB as ai_mastery_outbox
+    participant KF as Kafka ai.events
+    participant UM as UMFE 融合引擎
+
+    AI->>EV: POST /evaluate/conversation (SESSION_END)
+    EV->>DB: INSERT mastery_eval_task uk(conv,trigger) 抢占(G14)
+    alt 空结果(G3)
+        EV->>DB: status=EMPTY(终态)
+        EV-->>AI: 200 kpChanges=[]
+    else 正常评估
+        EV->>EV: Step1 知识点提取(≤20, ≥0.3)
+        EV->>EV: Step2 行为特征(12维)→understanding
+        EV->>DB: 读 student_kp_mastery 渠道快照(version)
+        EV->>EV: Step3 增量计算(硬顶±0.08/G5, 置信度/G4)
+        EV->>DB: 同事务: 明细upsert(CAS) + change_log(uk幂等) + outbox(G7)
+        EV->>DB: status=PUBLISHED
+        EV-->>AI: 200 (Outbox 已落库, G13)
+        OB->>KF: Relay SKIP LOCKED → ai_dialogue.assessed(partition=studentId, G11)
+        KF->>UM: MasterySignal(signalId=ai_dialogue:{conv}:{kp})
+    end
+```
+
+### 6.2 双源触发收敛（REST 与事件兜底）
+
+```mermaid
+sequenceDiagram
+    participant AI as AI 对话引擎
+    participant MQ as Kafka ai.conversation.ended
+    participant EV as 评估引擎
+    participant DB as MySQL
+
+    AI->>EV: REST 触发(主通道)
+    AI->>MQ: 事件(兜底, at-least-once)
+    MQ->>EV: consume conversation.ended
+    EV->>DB: INSERT mastery_eval_task uk(conv,SESSION_END)
+    alt REST 已抢占
+        DB-->>EV: uk 冲突 → 直接 ACK 丢弃
+    else 事件先到
+        EV->>EV: 正常评估流程
+        EV-->>AI: REST 后到时查询 taskId 返回同结果(幂等)
+    end
+```
+
+> 双源天然幂等：`mastery_eval_task.uk_conv_trigger` 为唯一裁决点，与《服务端-学生作业全生命周期管理》逾期双源收敛同构。
+
+### 6.3 D1 降级：Kafka 不可用直投 UMFE
+
+```mermaid
+sequenceDiagram
+    participant OB as Outbox Relay
+    participant RD as Redis
+    participant KF as Kafka ai.events
+    participant UM as UMFE
+    participant DB as MySQL
+
+    OB->>KF: publish 失败
+    OB->>RD: incr am:kf:down + expire 30s
+    Note over OB: 连续失败 > 30s 判定不可用
+    OB->>UM: GET /internal/mastery/signals/check?signalIds=...
+    UM-->>OB: 已存在集合(inbox 去重查询)
+    OB->>UM: POST /internal/mastery/signals (仅未存在信号)
+    UM-->>OB: 202
+    OB->>DB: outbox status=DIRECT_SENT
+    Note over OB: Kafka 恢复后 Relay 恢复常路, 直投通道自动停用
+```
+
+---
+
+## 7. 状态机与守卫
+
+### 7.1 评估任务状态机
+
+```
+                    ┌─────────────┐
+   触发(REST/事件)  │  RECEIVED   │
+  ─────────────────►│  (uk 抢占)  │
+                    └──────┬──────┘
+                           │ 提取结果为空
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌──────────┐ ┌───────────┐ ┌────────────┐
+        │ EXTRACTED│ │EMPTY(终)  │ │FAILED(重试)│──重试≤3──┐
+        └────┬─────┘ └───────────┘ └─────┬──────┘         │
+             │ 行为特征提取                │ 重试耗尽       │
+             ▼                           ▼               │
+        ┌──────────┐              ┌──────────┐           │
+        │CALCULATED│              │DEAD(终)  │◄──────────┘
+        └────┬─────┘              └──────────┘
+             │ 三表同事务(G7)
+             ▼
+        ┌──────────┐
+        │PUBLISHED │──Outbox Relay──► SENT(直投标记 DIRECT_SENT 为分支终态)
+        └──────────┘
+```
+
+| 状态 | 含义 | 终态 | 允许转移 |
+|------|------|------|----------|
+| RECEIVED | 已抢占任务槽 | 否 | EXTRACTED / EMPTY / FAILED |
+| EXTRACTED | 知识点提取完成（非空） | 否 | CALCULATED / FAILED |
+| CALCULATED | 增量计算完成，待持久化 | 否 | PUBLISHED / FAILED |
+| PUBLISHED | 三表已提交、Outbox 落库 | 否（Relay 侧） | Relay 标记 SENT/DIRECT_SENT |
+| EMPTY | 无知识点（G3） | 是 | — |
+| FAILED | 可重试异常 | 否 | RECEIVED(重试) / DEAD |
+| DEAD | 重试耗尽转人工 | 是 | 管理端重放(§5.4) |
+
+### 7.2 守卫总表 G1-G14
+
+| 守卫 | 规则 | 违反后果 |
+|------|------|----------|
+| G1 | 本引擎绝不写 `unified_mastery`（含一切降级路径） | 代码评审红线 + 集成测试拦截 |
+| G2 | 信号以会话为单位单发：`TURN_COMPLETE` 不发信号，`SESSION_END/FEEDBACK` 为唯一信号源 | signalId uk 冲突即拦截告警 |
+| G3 | 提取结果为空 → EMPTY 终态，不发信号不写日志 | — |
+| G4 | `selfConfidence < 0.30` 的信号丢弃，记 DROP 日志（delta=0） | — |
+| G5 | 单次增量硬顶 \|delta\| ≤ 0.08 | clamp 并记 evidence |
+| G6 | 渠道分 clamp [0,1]，禁越界写库 | DB CHECK 约束兜底 |
+| G7 | 渠道明细 + 变更日志 + Outbox 三表**同事务** | 事务外包即拒绝合入 |
+| G8 | 幂等键全局唯一语义：`ai_dialogue:{conversationId}:{kpId}`（FEEDBACK 为 `ai_dialogue:{feedbackId}:{kpId}`） | 与 UMFE inbox uk 对齐 |
+| G9 | 明细更新必须 version CAS，重读重试 ≤ 3 次后转串行队列 | 禁无条件 UPDATE |
+| G10 | 学生已注销/在删除冷静期内：拒写并标记清理任务（24h 内物理删除，合规 C5） | — |
+| G11 | Kafka 信号按 studentId 分区键保序 | 生产端强制 key=studentId |
+| G12 | 证据链禁存对话原文，只存 messageRefs + 12 维计数 | PII 扫描进 CI |
+| G13 | 评估接口返回 200 前 Outbox 必须已落库 | 集成测试断言 |
+| G14 | 任务可重入：同 `(conversationId,triggerType)` 并发触发仅一个执行（DB uk 抢占） | 后到者 202 轮询 |
+
+---
+
+## 8. 幂等与并发场景八则
+
+| # | 场景 | 裁决 |
+|---|------|------|
+| 1 | AI 引擎对同一会话重复 POST（超时重试） | uk 吞没，返回首次结果 + 52712 语义标记 |
+| 2 | REST 与 conversation.ended 事件并发到达 | DB uk 先到者胜，后到者丢弃/返回同 taskId（§6.2） |
+| 3 | TURN_COMPLETE 与 SESSION_END 先后触发 | TURN 明细并入 SESSION_END 重算，信号仅 SESSION_END 发一次（G2） |
+| 4 | 同会话两个 KP 的明细行并发 CAS | 行级锁互不影响；同学同行冲突走 G9 重试 |
+| 5 | Relay 投出信号但未收到 ACK 重投 | UMFE `mastery_signal_inbox` signalId uk 去重，双投无害（R3） |
+| 6 | D1 直投与 Kafka 恢复后 Relay 常路并发 | 直投前 check inbox（§6.3），后到通道经 uk 吞没 |
+| 7 | FEEDBACK 与 SESSION_END 同时评估同 KP | 不同 source_id 各自成信号，UMFE 按时间序融合（R4），本引擎不合并 |
+| 8 | 管理端重放（replay）与在线评估并发 | 重放任务走独立 task 行（triggerType=REPLAY），结果只写 change_log（标注 replay）不发信号，避免污染权威 |
+
+---
+
+## 9. 事件 Outbox 与对账
+
+### 9.1 ai_mastery_outbox
+
+```sql
+CREATE TABLE ai_mastery_outbox (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    event_id        VARCHAR(128) NOT NULL COMMENT 'signalId: ai_dialogue:{conversationId}:{kpId}',
+    event_type      VARCHAR(64)  NOT NULL DEFAULT 'ai_dialogue.assessed',
+    topic           VARCHAR(64)  NOT NULL DEFAULT 'ai.events',
+    partition_key   BIGINT       NOT NULL COMMENT 'studentId, 守卫 G11',
+    payload_json    JSON         NOT NULL,
+    status          VARCHAR(16)  NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/SENT/DIRECT_SENT/FAILED_RETRY/DEAD',
+    retry_count     INT          NOT NULL DEFAULT 0,
+    next_retry_at   DATETIME,
+    sent_at         DATETIME,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uk_event (event_id),
+    INDEX idx_status_retry (status, next_retry_at),
+    INDEX idx_partition (partition_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI对话掌握度信号Outbox';
+```
+
+### 9.2 发布事件（仅一种，§4.6）
+
+| 事件 | Topic | 消费方 | 说明 |
+|------|-------|--------|------|
+| `ai_dialogue.assessed` | `ai.events` | UMFE 融合引擎（唯一消费方） | 载荷 §4.4.3，UMFE 转 `MasterySignal`（R3） |
+
+### 9.3 上游订阅
+
+| 上游事件 | Topic | 用途 | 幂等 |
+|----------|-------|------|------|
+| `ai.conversation.ended` | `ai.events` | 触发兜底（REST 主通道失效时），双源收敛（§6.2） | `uk_conv_trigger` |
+| `ai.feedback.submitted` | `ai.events` | 点赞/点踩触发 `FEEDBACK` 增量评估 | `feedbackId` |
+
+> 本引擎**不订阅** `mastery.domain.events`（下游联动与己无关，防循环）；不订阅 GLCM/LSSA 任何实时信号（评估只依赖对话引擎交付的回合摘要）。
+
+### 9.4 日终对账（04:20，差异 > 2% 告警 P2）
+
+| 恒等式 | 说明 |
+|--------|------|
+| R1 | `change_log(AI_TUTOR, 当日)` 行数 = 当日 PUBLISHED 任务评估 KP 数（含 DROP/WEAK） |
+| R2 | `ai_mastery_outbox` 当日 event_id 集合 = 当日 change_log idempotent_key 集合（replay 除外） |
+| R3 | `student_kp_mastery.ai_tutor_count` 增量 = 当日该学生 change_log(AI_TUTOR) 计数（抽样 1% 学生全量核对） |
+| R4 | UMFE 侧 `mastery_signal_inbox` 当日 ai_dialogue 渠道信号数 = outbox SENT+DIRECT_SENT 数（经 UMFE 对账接口拉取） |
+
+---
+
+## 10. DDL 增补
+
+```sql
+-- 评估任务表（幂等抢占 + 审计）
+CREATE TABLE mastery_eval_task (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    conversation_id BIGINT NOT NULL,
+    trigger_type    VARCHAR(16)  NOT NULL COMMENT 'SESSION_END/TURN_COMPLETE/FEEDBACK/REPLAY',
+    feedback_id     BIGINT COMMENT 'FEEDBACK 触发时必填',
+    student_id      BIGINT NOT NULL,
+    status          VARCHAR(16) NOT NULL DEFAULT 'RECEIVED',
+    kp_count        INT COMMENT '提取知识点数',
+    signal_count    INT COMMENT '发布信号数(仅SESSION_END/FEEDBACK)',
+    duration_ms     INT,
+    error_code      VARCHAR(16),
+    retry_count     INT NOT NULL DEFAULT 0,
+    idempotent_resp JSON COMMENT '首次完成的响应快照, 幂等重放返回',
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+    UNIQUE KEY uk_conv_trigger (conversation_id, trigger_type),
+    INDEX idx_student_time (student_id, created_at),
+    INDEX idx_status_time (status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='掌握度评估任务';
+
+-- mastery_change_log 月分区（月增约 900 万行, 180 天归档 ClickHouse）
+ALTER TABLE mastery_change_log
+    PARTITION BY RANGE (TO_DAYS(created_at)) (...);   -- 由 DBA 分区规范落地
+
+-- student_kp_mastery 语义 CHECK（G6 兜底）
+ALTER TABLE student_kp_mastery
+    ADD CONSTRAINT chk_score_range CHECK (mastery_score BETWEEN 0 AND 1);
+```
+
+### 10.1 Redis 键
+
+| Key | 类型 | TTL | 说明 |
+|-----|------|-----|------|
+| `am:task:{conversationId}:{trigger}` | String（taskId 占位） | 24h | uk 抢占缓存镜像，DB 为权威 |
+| `am:kf:down` | Counter | 30s 滑窗 | Kafka 不可用判定（§6.3） |
+| `am:rl:trigger:{instance}` | 令牌桶 | — | 触发接口实例级限流（§5.1） |
+| `am:conv:last:{conversationId}` | Hash | 24h | TURN_COMPLETE 明细中间结果（并入 SESSION_END 用） |
+
+---
+
+## 11. 错误码（52700-52799）
+
+| 错误码 | HTTP | 语义 | 场景 |
+|--------|------|------|------|
+| 52700 | 500 | EVALUATION_INTERNAL_ERROR | 未分类异常，任务转 FAILED |
+| 52701 | 400 | INVALID_CONVERSATION_ID | conversationId 缺失/非法 |
+| 52702 | 400 | INVALID_TRIGGER_TYPE | triggerType 非法枚举 |
+| 52703 | 400 | TURNS_EMPTY | SESSION_END 但回合列表为空 |
+| 52704 | 400 | STUDENT_NOT_FOUND | studentId 不存在 |
+| 52705 | 403 | STUDENT_DELETED | 学生已注销（G10） |
+| 52706 | 400 | KP_ANNOTATION_MALFORMED | 标注结果结构非法 |
+| 52707 | 408 | EVALUATION_TIMEOUT | 评估超过 5s 预算，任务转异步 |
+| 52708 | 429 | TRIGGER_RATE_LIMITED | 触发限流（§5.1） |
+| 52710 | 200 | WEAK_SIGNAL_SKIPPED | 全部 KP 因信号过弱跳过（G3 细化，kpChanges 各 delta=0） |
+| 52711 | 200 | LOW_CONFIDENCE_DROPPED | 全部 KP 因低置信丢弃（G4，evidence 标 drop_reason） |
+| 52712 | 200 | DUPLICATE_EVALUATION | 幂等吞没，返回首次结果快照 |
+| 52713 | 200 | EMPTY_RESULT | 无知识点（G3，kpChanges=[]） |
+| 52714 | 200 | PARTIAL_PUBLISHED | 部分 KP 成功部分 DROP，正常语义 |
+| 52720 | 503 | UMFE_QUERY_UNAVAILABLE | 查询代理 UMFE 不可用（D8，带 Retry-After） |
+| 52721 | 503 | KP_SERVICE_UNAVAILABLE | 知识点服务不可用（触发 D4 降级） |
+| 52730 | 409 | REPLAY_PENDING_APPROVAL | 重放未获双人审批（G14） |
+
+---
+
+## 12. 降级矩阵 D1-D10
+
+| # | 故障 | 降级策略 | 红线 |
+|---|------|----------|------|
+| D1 | Kafka `ai.events` 不可用 > 30s | Relay 直投 UMFE HTTP 备用通道（先查 inbox 去重，§6.3） | 信号不丢（最终一致） |
+| D2 | UMFE HTTP 亦不可用 | Outbox 保留 PENDING，指数退避重试（1m/5m/15m/1h，上限 24h） | 禁丢信号、禁本地内存缓冲 > 5min |
+| D3 | Redis 宕机 | 去重/限流转 DB uk 与实例级计数；评估主流程不阻塞 | 吞吐降级 30% 可接受 |
+| D4 | 知识点服务不可用 | 仅用请求内 kpAnnotations + 回合 detectedKpIds，跳过前置/章节补充（§4.1.1 第 2/3 步） | 提取约束仍生效（≤20/≥0.3） |
+| D5 | 章节服务不可用 | 跳过章节背景补充 | 不影响显式标注知识点 |
+| D6 | AI 引擎重试风暴 | 单 conversationId 10s 内最多 2 次触发，超出 429 | 幂等吞没优先于限流拒绝 |
+| D7 | DB 主库不可用 | 任务转 FAILED，事件兜底通道保留待恢复重放 | 禁写从库 |
+| D8 | UMFE 查询不可用 | 查询接口 503 + Retry-After | **禁止读本表冒充融合掌握度** |
+| D9 | 全链路降级期间 | 禁放宽 G5 增量硬顶与 G4 置信度底线"冲量" | 信号质量不可降级 |
+| D10 | 总红线 | 掌握度信号最终一致不丢失；任何静默吞信号即 P1 事故 | — |
+
+---
+
+## 13. 监控指标与容量
+
+### 13.1 监控 M1-M10
+
+| 指标 | 口径 | 阈值 |
+|------|------|------|
+| M1 评估延迟 P99 | 触发→200 返回 | < 2s（承诺 5s 内，P1 > 5s） |
+| M2 触发 QPS / 拒绝率 | 实例级 | 拒绝率 > 5% P2 |
+| M3 日信号量 | ai_dialogue.assessed | 环比 ±50% 告警 |
+| M4 DROP/WEAK 占比 | 52710+52711 / 总 KP | > 40% P2（行为特征失真预警） |
+| M5 Outbox 积压 | PENDING+FAILED_RETRY 条数 | > 10 万 P1（D1/D2 激活检查） |
+| M6 D1 直投次数 | DIRECT_SENT | > 0 即 P2（Kafka 健康核查） |
+| M7 对账差异 | §9.4 四恒等式 | > 2% P2 |
+| M8 重放差异率 | replay 结果与历史 >0.05 占比 | > 5% P2（模型/口径漂移） |
+| M9 CAS 重试率 | G9 重读重试占比 | > 10% P3 |
+| M10 注销清理延迟 | G10 物理删除时延 | > 24h P1（合规） |
+
+### 13.2 容量（DAU 50 万基准）
+
+- 触发量：日会话 60 万 ×（1 SESSION_END + 平均 1.5 TURN_COMPLETE + 0.2 FEEDBACK）≈ 日 162 万任务；峰值 80 QPS。
+- 信号量：SESSION_END 平均评估 5 KP ≈ 日 300 万信号；每信号 payload < 1KB。
+- 存储：`mastery_change_log` 日 300 万行（月分区，180 天归档 ClickHouse）；`ai_mastery_outbox` 日 300 万行（SENT 后 7 天清理）；`mastery_eval_task` 日 162 万行（90 天归档）。
+- Redis：dedup/中间态键峰值 ≈ 200MB；无大 value。
+- 计算：评估纯内存计算（提取+特征+增量 < 20ms/会话），无 LLM 调用——**本引擎不在 LLM 调用链上**，无 GPU/Token 成本。
+
+---
+
+## 14. 合规红线 C1-C10
+
+| # | 红线 |
+|---|------|
+| C1 | 证据链（change_log/evidence_json）禁存对话原文与 PII，只存 messageRefs + 12 维计数（G12） |
+| C2 | 未成年人数据最小化：不采集设备指纹、不采集音频图像 |
+| C3 | 家长端可见度：仅展示等级变化趋势与聚合解释，不展示逐回合行为明细（防标签化） |
+| C4 | 掌握度推断禁用于排名、惩戒、分班；教师侧仅 band 化聚合（与 UMFE/雷达服务一致） |
+| C5 | 删除权：学生注销 24h 内物理删除本引擎三表数据（G10/M10），冷静期 7 天只拒写 |
+| C6 | 行为推断（如 abandoned）禁作"学习态度"结论输出给学生/家长，仅作评估内部特征 |
+| C7 | 单会话评估不构成任何学业结论；连续信号由 UMFE 时序融合后才可对外 |
+| C8 | 审计日志（eval_task 全量 + 管理端操作）保留 180 天 |
+| C9 | 本引擎数据禁回流广告/营销画像 |
+| C10 | 可解释：学生/家长经"为什么这样评估"入口可查看证据链摘要（§5.3 GetChannelEvidence） |
+
+---
+
+## 15. 契约对齐 R1-R14
+
+| # | 契约 | 对方文档 | 裁决 |
+|---|------|----------|------|
+| R1 | 掌握度读取权威 = UMFE | 《服务端-多渠道学习数据融合与统一知识掌握度计算引擎》 | 本引擎查询接口纯代理（§5.5） |
+| R2 | 能力维度更新唯一入口 = 雷达数据服务 | 《服务端-学科能力维度评估与多维度能力雷达图数据服务》 | 本引擎不发布维度事件；behaviorProfile 内嵌信号供其消费（其 v1.1 扩展需求） |
+| R3 | `ai_dialogue.assessed` → `MasterySignal` 转换 | UMFE §5.5 | signalId/selfConfidence/分区键口径对齐（§4.4.3） |
+| R4 | 下游联动（复习/推荐/通知）一律由 `mastery.domain.events` 驱动 | UMFE | 本引擎不直发不扇出（§4.6） |
+| R5 | 触发方 = AI 对话引擎；REST 主 + `ai.conversation.ended` 事件兜底 | 《AI对话引擎与会话管理》 | 双源收敛（§6.2） |
+| R6 | `TURN_COMPLETE` 不发布信号 | 本引擎内部契约 | 会话级合并，信号单发（G2） |
+| R7 | `ConversationTurnSummary.practiceCorrect` 字段 | 《服务端-AI辅导对话嵌入式即时练习与实时理解度检测引擎》 | 嵌入式练习回合上报填充（§4.2.1 载荷契约） |
+| R8 | 知识点标注复用 | 《AI回答知识点自动标注与溯源引用系统》 | kpAnnotations 直接复用其输出，不重标 |
+| R9 | 学生可见等级权威 = UMFE 迟滞口径 | UMFE §4.6 | 渠道侧迟滞仅证据链展示（§4.3.2） |
+| R10 | 遗忘衰减归 UMFE | UMFE §4.4 | `decayed_score` 恒 NULL（§4.4.1） |
+| R11 | `student_kp_mastery` 禁作读取源 | 全库 | 仅证据链/调试（G1） |
+| R12 | 计数口径：ai_tutor/exposure 本引擎 SSOT；practice/correct 归练习判题服务 | 《多题型统一判题引擎》 | 本引擎不累加 practice/correct（§4.4.2） |
+| R13 | 提取约束（≤20/≥0.3/前置 ≤5 上限 0.4） | 本引擎 §4.1.2 | 与 UMFE 消费容量联合约束 |
+| R14 | 管理端重放双人审批 + 审计 | 《服务端审计日志与操作追溯系统》 | replay 结果不发信号（§8-8） |
+
+---
+
+## 16. 验收场景（18 条）
+
+1. SESSION_END 正常评估：5 KP 变更，三表同事务，信号 5 条按 studentId 分区有序发出。
+2. 重复 POST 同一会话：返回首次结果快照，52712，无重复信号。
+3. 提取为空（闲聊会话）：EMPTY 终态，kpChanges=[]，52713。
+4. 全 KP 弱信号：52710，change_log 记 delta=0。
+5. 全 KP 低置信：52711，evidence 含 drop_reason。
+6. TURN_COMPLETE 后 SESSION_END：信号仅一次，TURN 明细并入重算。
+7. REST 与事件并发触发：uk 裁决单执行，无双重评估。
+8. FEEDBACK 点踩：负向增量，独立 source_id，与 SESSION_END 信号并存由 UMFE 时序融合。
+9. 增量硬顶：understanding=1.0、relevance=1.0 时 delta 恰为 +0.08。
+10. 成熟知识点衰减：ai_tutor_count=10 时 maturityScale ≈ 0.4，单次变化更小。
+11. version CAS 冲突：重读重试成功，无丢失更新。
+12. Kafka 宕机 60s：D1 直投激活，inbox 去重校验，Kafka 恢复后自动回切。
+13. UMFE 查询宕机：查询接口 503 + Retry-After，日志确认未读本表兜底。
+14. 知识点服务宕机：D4 降级仅请求内知识点参与评估。
+15. 注销学生触发评估：52705，24h 内三表数据物理删除（M10 达标）。
+16. 管理端 replay：双人审批后执行，结果差异 >0.05 触发 M8 告警，不发信号。
+17. 日终对账：人为删 100 条 outbox，四恒等式 R1/R2 告警命中。
+18. 证据链审计：change_log 全文无对话原文（正则抽检 + CI 的 PII 扫描通过）。
+
+## 17. 关联文档
+
+- 《服务端-多渠道学习数据融合与统一知识掌握度计算引擎》（权威裁决对方，R1/R3/R4/R9/R10）
+- 《服务端-学科能力维度评估与多维度能力雷达图数据服务》（维度权威，R2）
+- 《AI对话引擎与会话管理》（触发方，R5）
+- 《AI回答知识点自动标注与溯源引用系统》（标注复用，R8）
+- 《服务端-AI辅导对话嵌入式即时练习与实时理解度检测引擎》（practiceCorrect 载荷，R7）
+- 《服务端审计日志与操作追溯系统》（R14）
+- 端到端：《端到端流程设计-AI智能辅导对话完整链路》《端到端流程设计-学情分析与学习报告完整链路》
+
+---
+
+> **v1.1 维护记录（2026-09-21）**：补齐原文件截断内容（原 514 行止于 §4.1.1 代码块未闭合）。本次将 §4.1.2–§4.6 直接补入主文件（12 维行为特征、增量公式与单次幅度限制 G5、置信度计算、事务边界 G7/G8、能力维度委托聚合 F2、MasterySignal 载荷），并新增 §5-§17 全套（API 汇总与幂等限流、时序图×3、状态机+守卫 G1-G14、幂等八场景、Outbox 与对账四恒等式、DDL 增补、错误码 52700-52799 共 22 项、降级 D1-D10、监控 M1-M10 与 DAU50 万容量、合规 C1-C10、契约 R1-R14、验收 18 条）。
+>
+> **v1.0 缺陷登记（F1-F6，v1.1 全部修复）**：
+> - F1：§3.3.1 对话完成触发接口与 §3.3.2 掌握度评估结果接口均无幂等语义 → §5.2/§8 补 `Idempotency-Key(request_id)` 幂等 + 在途互斥（G2/G3）；
+> - F2：能力维度聚合直接写学习画像，越权越过 UMFE 融合权威 → §4.5.1 权威边界裁决改委托模式，维度只发信号（R2）；
+> - F3：§3.3.3 四个查询接口直接读本引擎 `student_kp_mastery`，与 UMFE 权威冲突 → §5.5 查询接口代理化（降级红线 D8）；
+> - F4：标注引擎 `knowledgePointId` 为字符串全局编码未声明解析规则 → §4.1/§4.2 边界裁决统一解析为 BIGINT，失败记 `kp_resolve_failures`；
+> - F5：`mastery_eval_task`/`mastery_change_log` 等评估任务与变更日志表无统一幂等键与乐观锁约束 → §8 幂等八场景 + §10 DDL 增补唯一键与乐观锁列；
+> - F6：间隔重复引擎订阅表原登记 `knowledge_point.weak_kp_detected` 来源为"知识点体系" → §4.6.2 生产者裁决改为本引擎（允许双写，UMFE 幂等收敛）。
+>
+> 错误码段 52700-52799 经全库扫描无冲突（52300 语音/52400 推送/52500-52600 已占用，58800(RLHF)/58900(查重)/59000(课后答疑) 等相邻段亦已被占用，取空段 52700）。

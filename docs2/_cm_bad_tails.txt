@@ -1,51 +1,3 @@
-==== 客户端-文科背诵页面架构与交互设计-详细设计.md | 577 lines | unclosed: ```@L570 ====
-#### 3.5.4 Step 3：关键词提示回忆
-
-```
-┌──────────────────────────────────┐
-│ Step 3/4 · 关键词回忆  第 1/2 段  │
-├──────────────────────────────────┤
-│                                  │
-│  ┌────────────────────────────┐  │
-│  │  床前____光，疑是____霜。  │  │
-│  │  (填空部分高亮显示)         │  │
-
-==== 服务端-AI辅导对话知识点掌握度实时更新与能力维度同步引擎-详细设计.md | 579 lines | unclosed: ```@L518 ====
-        }
-        
-        // 4. 过滤：只保留相关性 >= 0.3 的知识点
-        return kpScores.entrySet().stream()
-            .filter(e -> e.getValue() >= 0.3)
-            .map(e -> new WeightedKnowledgePoint(e.getKey(), e.getValue()))
-            .sorted(Comparator.comparing(WeightedKnowledgePoint::getWeight).reversed())
-            .collect(Collectors.toList());
-    }
-}
-
-==== 服务端-学生解题过程分步评分与过程性评价服务-详细设计.md | 594 lines | unclosed: ```@L570 ====
-│  └─────────────┘                                                  │
-│        │                                                          │
-│        ▼                                                          │
-│  ③ 获取参照解题过程                                                │
-│  ┌─────────────┐                                                  │
-│  │ 标准答案获取 │──→ 调用理科解题步骤推导服务获取标准解法            │
-│  │             │──→ 获取题目元数据(知识点/题型/难度/评分标准)       │
-│  └─────────────┘                                                  │
-│        │                                                          │
-│        ▼                                                         
-
-==== 端到端流程设计-拼音识字启蒙完整链路-详细设计.md | 607 lines | unclosed: ```@L597 ====
-┌───────────────────────────────────────────────────────────────┐
-│                   汉字识记完整流程                               │
-├───────────────────────────────────────────────────────────────┤
-│                                                               │
-│  用户进入识字入口                                              │
-│       │                                                       │
-│       ▼                                                       │
-│  ┌─────────────┐                                              │
-│  │ 字库选择     │ ←── 按教材 / 按主题 / 按偏旁 / 智能推荐      │
-│  └──────┬──────┘                                              │
-
 ==== 服务端-教材修订内容变更检测与平台内容影响评估引擎-详细设计.md | 620 lines | unclosed: ```@L528 ====
         if (!matchedNew.contains(j)) {
             changes.add(buildAddedChange(newPoints.get(j)));
@@ -69,18 +21,6 @@ private static final double KNOWLEDGE_WEAK_THRESHOLD = 0.50;
     ]);
     set({
       menus
-
-==== 服务端-AI对话追问拓展与多轮交互响应编排引擎-详细设计.md | 623 lines | unclosed: ```@L585 ====
-    },
-    
-    FollowUpAction.GIVE_EXAMPLE: {
-        "strategy_tag": "follow_up_example",
-        "system_instruction": (
-            "你是一个善于举例的老师。学生希望看到具体的例子来帮助理解。\n"
-            "要求：\n"
-            "1. 提供 2-3 个由浅入深的例子\n"
-            "2. 第一个例子用最简单、最生活化的场景\n"
-            "3. 逐步增加复杂度，最后一个贴近考试题目
 
 ==== 服务端-小学科学探究式学习智能辅导与虚拟实验引导引擎-详细设计.md | 626 lines | unclosed: ```@L572 ====
     },
@@ -153,6 +93,18 @@ POST /api/v1/incentive/rewards/ack
   "user_answer": "go",                // 用户答案（错题讲解时传入）
   "explanation_depth": "detailed",    // brief/detailed/deep
   "include_contrast": true            // 是否包含易混对比
+
+==== 服务端-AI对话追问拓展与多轮交互响应编排引擎-详细设计.md | 643 lines | unclosed: ```@L605 ====
+    },
+    
+    FollowUpAction.GIVE_EXAMPLE: {
+        "strategy_tag": "follow_up_example",
+        "system_instruction": (
+            "你是一个善于举例的老师。学生希望看到具体的例子来帮助理解。\n"
+            "要求：\n"
+            "1. 提供 2-3 个由浅入深的例子\n"
+            "2. 第一个例子用最简单、最生活化的场景\n"
+            "3. 逐步增加复杂度，最后一个贴近考试题目
 
 ==== 服务端统一数据对账与跨服务一致性校验引擎-详细设计.md | 644 lines | unclosed: ```@L537 ====
             }

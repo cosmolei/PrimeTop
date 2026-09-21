@@ -663,3 +663,383 @@ POST /api/v1/pdf-exports/preview
 |------|------|------|
 | WeasyPrint | Python 原生，HTML/CSS → PDF，支持 CSS Paged Media | ✅ 主渲染引擎 |
 | ReportLab | Python，编程式 PDF 生成，精确控制排版 | 备选，用于复杂图表 |
+
+
+**选型理由：**
+
+1. WeasyPrint 对 CSS Paged Media 规范支持最完整（@page 规则、named pages、running headers/footers、page counters），是"打印友好"需求的最佳匹配。
+2. 纯 Python 技术栈，与现有数据聚合服务（Python/FastAPI）同构，无需额外引入 Node 运行时。
+3. KaTeX 服务端渲染快于 MathJax（单次 <5ms/公式），且输出 SVG 可无损缩放嵌入 PDF。
+4. matplotlib 输出 SVG 矢量图嵌入 HTML，随 WeasyPrint 一并转为 PDF 矢量对象。
+
+**渲染服务部署形态：** 独立微服务 `pdf-render-service`（Python 3.11 + FastAPI + WeasyPrint），与任务编排层通过 Redis Stream 解耦。渲染为 CPU 密集型操作，单页渲染约 200-800ms。
+
+### 5.2 渲染管线架构
+
+```text
+导出任务(pending)
+    │
+    ▼
+[Stage 1: 内容聚合]  ──► 按 content_type 调用对应内容聚合器，拉取原始数据
+    │                      （错题/报告/笔记/知识点/练习/作文/计划）
+    ▼
+[Stage 2: 内容适配]  ──► 数据 → 模板区段模型（SectionData）
+    │                      公式转 LaTeX、图片转内嵌资源、文本清洗
+    ▼
+[Stage 3: HTML 生成] ──► Jinja2 模板 + 样式配置 → 完整 HTML 文档
+    │
+    ▼
+[Stage 4: 公式/图表渲染] ──► KaTeX(matplotlib) 渲染 → SVG 内联
+    │
+    ▼
+[Stage 5: PDF 合成]  ──► WeasyPrint HTML→PDF（分页、页眉页脚、目录）
+    │
+    ▼
+[Stage 6: 后处理]    ──► 元数据写入（标题/作者/页数）、水印叠加、文件大小检查
+    │
+    ▼
+[Stage 7: 上传存储]  ──► 流式上传 OSS → 生成 CDN 签名 URL
+    │
+    ▼
+任务(completed) + 下发下载通知
+```
+
+**各阶段延迟预算（A4 约 20 页典型任务）：**
+
+| 阶段 | 预算 | 说明 |
+|------|------|------|
+| Stage 1 内容聚合 | ≤2s | 批量 RPC 拉取，并行进行 |
+| Stage 2 内容适配 | ≤1s | 纯计算 |
+| Stage 3 HTML 生成 | ≤500ms | Jinja2 渲染 |
+| Stage 4 公式/图表 | ≤3s | 公式数量相关，KaTeX 单公式 <5ms |
+| Stage 5 PDF 合成 | ≤15s | 页数相关，约 500ms/页 |
+| Stage 6 后处理 | ≤1s | pypdf 元数据 |
+| Stage 7 上传存储 | ≤2s | 流式上传 |
+| **总计 P99** | **≤30s** | 超预算任务标记 slow_render |
+
+### 5.3 HTML 中间表示
+
+渲染引擎不直接操作原始数据，而是经"内容适配层"将各类型数据转换为统一的中间模型：
+
+```python
+class SectionData(BaseModel):
+    """渲染区段统一中间模型"""
+    section_id: str
+    section_type: SectionType
+    title: str | None
+    items: list[BlockItem]                    # 有序块列表
+
+class BlockItem(BaseModel):
+    """块级元素（题目/段落/表格/图表等）"""
+    block_type: BlockType                     # QUESTION / PARAGRAPH / FORMULA / TABLE / CHART / IMAGE / DIVIDER / TAG_ROW
+    content: str                              # 主内容（HTML 安全文本或 LaTeX）
+    sub_content: str | None = None            # 次级内容（如解析步骤）
+    metadata: dict = {}                       # 扩展信息（难度、知识点、错因等）
+    children: list["BlockItem"] = []          # 嵌套块（题目→选项/解析）
+    page_break_before: bool = False           # 强制分页
+
+class RenderContext(BaseModel):
+    """渲染上下文"""
+    task_id: str
+    template: ExportTemplate
+    student_name: str                         # 可脱敏
+    student_grade: str | None
+    generated_at: datetime
+    content_meta: dict                        # 类型相关元数据
+```
+
+**内容聚合器注册表（按 content_type 路由）：**
+
+```python
+class ContentAggregator(Protocol):
+    async def aggregate(self, user_id: int, params: dict) -> list[SectionData]: ...
+
+AGGREGATOR_REGISTRY: dict[ExportContentType, ContentAggregator] = {
+    ExportContentType.MISTAKE_BOOK: MistakeBookAggregator(),           # → 错题服务 RPC
+    ExportContentType.STUDY_REPORT: StudyReportAggregator(),           # → 学习报告服务 RPC
+    ExportContentType.KNOWLEDGE_SUMMARY: KnowledgeSummaryAggregator(), # → 知识点服务 RPC
+    ExportContentType.NOTE_COLLECTION: NoteCollectionAggregator(),     # → 笔记服务 RPC
+    ExportContentType.EXERCISE_SHEET: ExerciseSheetAggregator(),       # → 练习服务 RPC
+    ExportContentType.ESSAY_REVIEW: EssayReviewAggregator(),           # → 作文服务 RPC
+    ExportContentType.STUDY_PLAN: StudyPlanAggregator(),               # → 规划服务 RPC
+}
+```
+
+### 5.4 数学公式渲染
+
+- 源数据中的公式以 LaTeX 字符串存储（与《学科公式 LaTeX 统一解析与多端渲染管线引擎》契约一致）。
+- 渲染管线用 **KaTeX 服务端渲染**输出 SVG，内联进 HTML。
+- KaTeX 不支持的环境自动降级为 matplotlib mathtext 渲染 PNG @300dpi。
+- **渲染失败兜底：** 公式渲染异常时原样输出 LaTeX 源码文本（不做静默丢弃），并在 PDF 页脚统计区记录 degraded_formulas 数量。
+
+```python
+class FormulaRenderer:
+    async def render(self, latex: str, display_mode: bool) -> str:
+        try:
+            return katex.render_to_string(latex, display_mode=display_mode)
+        except KaTeXError:
+            return self._matplotlib_fallback(latex, display_mode)
+        except Exception:
+            # 绝不静默丢弃：原样输出 + 标记
+            return f'<code class="latex-fallback">{html.escape(latex)}</code>'
+```
+
+### 5.5 图表渲染
+
+| 图表类型 | 引擎 | 输出 |
+|----------|------|------|
+| 学习时长/正确率统计图 | matplotlib | SVG 内联 |
+| 能力雷达图 | matplotlib (polar) | SVG 内联 |
+| 知识图谱关系图 | networkx 布局 + matplotlib | SVG 内联 |
+| 进度曲线 | matplotlib | SVG 内联 |
+
+所有图表使用与模板一致的配色（primary_color/accent_color），DPI≥150，字体使用与正文一致的 NotoSansSC 保证视觉统一。
+
+### 5.6 打印优化
+
+1. **字体嵌入：** NotoSansSC 子集化嵌入（仅导出内容用到的字形，通常 <1MB），公式字体（KaTeX fonts）按需嵌入。
+2. **灰度安全：** `use_color=false` 时全部转为灰度配色（primary_color → #333333），图表同步转灰度，保证黑白打印可读。
+3. **分页控制：**
+   - 题目块不允许跨页截断（`break-inside: avoid`）；
+   - 区段标题与首块保持同页（`break-after: avoid`）；
+   - 长解析自动在步骤边界分页，步骤内容不截断。
+4. **页眉页脚：** 每页页眉显示导出类型+学生（脱敏）+日期；页脚显示页码（第 X / 共 Y 页）+ 平台水印信息。
+5. **装订留白：** `binding_margin>0` 时左/右边距按奇偶页交替（CSS `@page :left/:right` 实现双面打印）。
+6. **文件体积控制：** 图片超过 300KB 自动重采样至 150dpi JPEG；单文件硬上限 50MB（超出即失败 EXPORT_CONTENT_TOO_LARGE）。
+
+---
+
+## 6. 核心处理流程
+
+### 6.1 导出任务创建时序
+
+```text
+客户端            API网关           ExportOrchestrator      配额服务        Redis Stream      Render Worker
+  │ 创建导出         │                  │                     │                │                │
+  ├─────────────────►│ 鉴权/参数校验     │                     │                │                │
+  │                  ├─────────────────►│                     │                │                │
+  │                  │                  ├─ 1. 配额预检(remaining>0)              │                │
+  │                  │                  ├────────────────────►│                │                │
+  │                  │                  │◄──── monthly_remaining│                │                │
+  │                  │                  ├─ 2. 模板校验/默认模板选择              │                │
+  │                  │                  ├─ 3. 落库 task(status=pending)          │                │
+  │                  │                  ├─ 4. XADD render:queue                    │                │
+  │                  │◄─────────────────┤                     │                │                │
+  │◄─────────────────┤ 202 {task_id}    │                     │                │                │
+  │                  │                  │                     │                │ XREADGROUP     │
+  │                  │                  │                     │                ├───────────────►│
+  │  轮询进度        │                  │                     │                │                │
+  ├─ GET /{task_id}►│                  │                     │                │                │
+  │◄─────────────────┤ status/progress  │                     │                │                │
+```
+
+### 6.2 渲染 Worker 处理流程
+
+```python
+async def process_render_task(task_id: str):
+    task = await db.get_task(task_id)
+    # CAS 抢占：pending → processing（防多 Worker 重复消费）
+    if not await db.cas_status(task_id, "pending", "processing", expected_version=task.version):
+        return
+    try:
+        await db.update_progress(task_id, 5, "正在聚合内容")
+        sections = await aggregate_content(task)           # Stage 1-2
+
+        await db.update_progress(task_id, 30, "正在生成文档")
+        html = await render_html(task.template, sections)   # Stage 3-4
+
+        await db.update_progress(task_id, 60, "正在渲染 PDF")
+        pdf_bytes = await render_pdf(html, task.template)   # Stage 5-6
+
+        await db.update_progress(task_id, 85, "正在上传")
+        file_key, download_url = await upload_to_oss(task, pdf_bytes)  # Stage 7
+
+        # 事务：状态完成 + 配额扣减 + Outbox 事件
+        async with db.transaction():
+            await db.cas_status(task_id, "processing", "completed")
+            await db.fill_result(task_id, file_key, download_url, page_count, size)
+            if not task.quota_consumed:
+                await quota_service.consume(task.user_id, task_id)
+            await outbox.insert("pdf_export.completed", {...})
+    except QuotaExceededError as e:
+        await fail_task(task_id, "EXPORT_QUOTA_EXCEEDED", e)
+    except ContentEmptyError as e:
+        await fail_task(task_id, "EXPORT_CONTENT_EMPTY", e)
+    except RenderTimeoutError:
+        # 超时：允许重试一次，仍失败则标记 failed
+        if task.retry_count < 1:
+            await retry_task(task_id)
+        else:
+            await fail_task(task_id, "EXPORT_RENDER_TIMEOUT", ...)
+    except Exception as e:
+        await fail_task(task_id, "EXPORT_INTERNAL_ERROR", e)
+```
+
+### 6.3 配额扣减时机（关键裁决）
+
+**裁决：配额在任务创建时"预占"，渲染成功后"确认"，失败/取消时"释放"。** 避免"渲染半天最后因配额失败"的糟糕体验，也避免刷接口消耗配额。
+
+```text
+创建任务 ──► 预占配额（monthly_used+1, reserved=true）──► 渲染成功 ──► 确认（reserved=false）
+                                    │
+                                    └──► 失败/取消 ──► 释放配额（monthly_used-1）
+```
+
+- 预占与释放在同一事务内更新 `pdf_export_quotas`；
+- 任务 TTL：pending 超过 30 分钟未消费自动释放配额并标记 expired；
+- 释放幂等：`quota_release_log (task_id)` 唯一键，重复释放请求直接返回成功。
+
+---
+
+## 7. 导出任务状态机与守卫
+
+### 7.1 状态机
+
+```text
+              创建成功                 渲染成功                OSS上传成功
+                 │                       │                       │
+  ┌────┐    ┌────▼─────┐    ┌─────────┐  │   ┌──────────┐   ┌────▼──────┐
+  │pending├──►processing├──►│completed│◄─┴──►│completed │──►│completed  │
+  └─┬──┘    └────┬─────┘    └─────────┘      └──────────┘   └───────────┘
+    │            │
+    │ 取消/超时  │ 渲染失败(可重试且retry_count<1)
+    ▼            ▼
+  cancelled    retrying ──► processing
+    │            │
+    │            │ 重试仍失败
+    │            ▼
+    │          failed
+    │
+    │ 配额预占超时(30min未消费)
+    └────► expired（自动释放配额）
+```
+
+状态集合：`pending / processing / retrying / completed / failed / cancelled / expired`
+
+### 7.2 状态守卫表
+
+| 守卫 | 规则 | 说明 |
+|------|------|------|
+| G1 | pending→processing 需 CAS 抢占 | 仅一个 Worker 可领取任务 |
+| G2 | completed 为终态，不可逆 | 文件已生成不可变更 |
+| G3 | cancelled 仅允许自 pending/retrying | processing 中取消需先中断 Worker 并回收配额 |
+| G4 | failed 允许客户端"重新导出"（创建新任务） | 不重跑旧任务，保证审计链完整 |
+| G5 | expired 仅由扫描器产生 | 用户不可见 expired，列表查询映射为 failed |
+| G6 | 配额预占/释放/确认必须与状态迁移同事务 | 防配额泄漏 |
+| G7 | include_answer=false 的练习卷 completed 后，若用户再次请求含答案版本，视为新任务 | 答案属敏感内容，不缓存复用 |
+
+### 7.3 幂等设计
+
+- **创建幂等：** 客户端携带 `Idempotency-Key`（或 client_token），服务端按 `(user_id, client_token)` 唯一约束 24h 去重，命中直接返回已有任务。
+- **取消幂等：** cancel 操作重复调用返回当前状态，不报错。
+- **配额操作幂等：** `quota_release_log(task_id)` 唯一键。
+- **上传幂等：** OSS key = `exports/{user_id}/{task_id}.pdf`，天然幂等（覆盖写安全，内容确定性）。
+
+---
+
+## 8. API 错误码总表
+
+| 错误码 | HTTP | 客户端提示 | 可重试 |
+|--------|------|-----------|--------|
+| EXPORT_QUOTA_EXCEEDED | 429 | 本月导出次数已用完，升级会员获得更多次数 | 否 |
+| EXPORT_CONTENT_EMPTY | 422 | 所选范围内没有可导出的内容 | 否 |
+| EXPORT_CONTENT_TOO_LARGE | 422 | 内容过多（超100页/50MB），请缩小时间范围或章节 | 否 |
+| EXPORT_INVALID_PARAMS | 400 | 参数有误，请检查选择项 | 否 |
+| EXPORT_PREMIUM_ONLY | 403 | 该模板为会员专属 | 否 |
+| EXPORT_TASK_NOT_FOUND | 404 | 任务不存在或已过期 | 否 |
+| EXPORT_TASK_ALREADY_CANCELLED | 409 | 任务已取消 | 否 |
+| EXPORT_RENDER_TIMEOUT | 500 | 生成超时，请稍后重试 | 是 |
+| EXPORT_INTERNAL_ERROR | 500 | 系统繁忙，请稍后重试 | 是 |
+| EXPORT_UPSTREAM_UNAVAILABLE | 503 | 内容服务暂不可用，请稍后重试 | 是 |
+
+**错误码段：** 服务端内部占用 `50500-50599`；客户端映射 `0305xx` 段（030501-030509）。
+
+---
+
+## 9. 事件设计
+
+### 9.1 Outbox 事件（producer = pdf-export-service）
+
+| 事件 | 时机 | 关键载荷 | 消费方 |
+|------|------|----------|--------|
+| pdf_export.completed | 导出成功 | task_id, user_id, content_type, page_count, file_size | 通知中心（"你的资料已生成"站内信）、埋点平台 |
+| pdf_export.failed | 导出失败 | task_id, user_id, error_code | 通知中心（失败提醒+重试引导）、监控告警 |
+| pdf_export.quota_consumed | 配额确认 | user_id, task_id, monthly_used | 会员权益统计 |
+
+### 9.2 消费的上游事件
+
+| 事件 | 用途 |
+|------|------|
+| membership.activated / membership.expired | 刷新月度配额上限（免费 3 次/月，月度会员 20 次/月，年度会员 50 次/月） |
+| user.data_erasure_requested | 注销时清理未过期导出文件与配额记录（延迟 7 天执行，对齐数据导出与账户注销链路） |
+
+---
+
+## 10. 监控与告警
+
+| 指标 | 口径 | 告警阈值 |
+|------|------|----------|
+| render_success_rate | 成功任务/完成任务 | <95% 持续 15min → P2 |
+| render_p99_seconds | 渲染总耗时 P99 | >45s 持续 10min → P2 |
+| queue_backlog | render:queue 未消费条数 | >500 → P2；>2000 → P1 |
+| dlq_count | 渲染失败入死信数 | 任意增加 → P2 |
+| quota_release_leak | reserved=true 超过 1h 的配额记录数 | >0 → P2（配额泄漏） |
+| slow_render_ratio | 超 30s 任务占比 | >10% → P3 |
+| oss_upload_fail | 上传失败率 | >1% → P2 |
+
+**容量估算（DAU 50 万，导出渗透率 3%）：**
+- 日导出任务 ≈ 1.5 万，峰值 ≈ 3 QPS；
+- 平均任务 20 页/2MB → 日新增 OSS 存储 ≈ 30GB；文件保留 30 天 → 在线存储 ≈ 900GB；
+- Render Worker：3 QPS × 平均 8s/任务 ≈ 24 并发 → 部署 8 实例（2C4G）留 3 倍余量。
+
+---
+
+## 11. 安全与合规
+
+1. **未成年人内容安全：** 导出内容均来自平台内容；笔记导出前校验 UGC 审核状态，未过审笔记不导出。
+2. **个人信息脱敏：** 封面学生姓名默认输出，导出参数 `student_name_mode` = `full / first_only / anonymous` 控制；分享场景建议 `anonymous`。
+3. **下载链接安全：** CDN URL 携带 HMAC 签名，有效期 24h（`expires_at`），过期重新请求获取新链接（不消耗配额）。
+4. **水印：** 免费用户导出添加浅水印 "PrimeTop 免费导出"；会员导出无可见水印。PDF 元数据（Creator/Producer）不含内部系统信息。
+5. **数据保留：** 导出文件 OSS 保留 30 天后转低频存储，90 天后删除；任务记录保留（下载链接失效）。
+6. **答案管控对齐：** 练习卷导出 `include_answer` 默认 false，传 true 仅会员可用且答案页单独分页（便于教师收答案页），与《答案管控与渐进式提示引擎》红线一致。
+7. **防刷：** 同一用户同内容类型 1 分钟内限创建 3 个任务（Redis 计数），超限返回 429。
+
+---
+
+## 12. 验收场景
+
+| # | 场景 | 预期 |
+|---|------|------|
+| 1 | 导出数学错题本（含公式/图片） | PDF 公式清晰、图片清晰、按章节分组、含错因标签 |
+| 2 | 导出无错题的错题本 | 返回 EXPORT_CONTENT_EMPTY |
+| 3 | 免费用户导出第 4 次 | 返回 EXPORT_QUOTA_EXCEEDED，提示会员权益 |
+| 4 | 会员导出超月度上限 | 同上 |
+| 5 | 取消 pending 任务 | 状态 cancelled，配额释放 |
+| 6 | 取消 processing 任务 | Worker 中断，配额释放，状态 cancelled |
+| 7 | 重复点击创建（同 client_token） | 返回同一 task_id，不产生重复任务 |
+| 8 | 渲染超时 | 自动重试 1 次；仍失败标记 failed 并通知 |
+| 9 | 下载链接过期后重新请求 | 返回新链接，不扣配额 |
+| 10 | 练习卷 include_answer=false | PDF 无答案内容，含独立答题卡 |
+| 11 | 黑白打印模式（use_color=false） | 输出灰度 PDF，图表灰度可读 |
+| 12 | 双面打印（binding_margin=10） | 奇偶页边距交替正确 |
+| 13 | 大量错题（>100 页） | 返回 EXPORT_CONTENT_TOO_LARGE |
+| 14 | 模板渲染中图片 >300KB | 自动重采样至 150dpi，文件不超限 |
+| 15 | KaTeX 不支持的公式 | 降级 matplotlib 渲染，不静默丢弃 |
+| 16 | OSS 上传失败 | 任务 failed，可重试，配额已释放 |
+| 17 | 注销用户的数据擦除 | 7 天内导出文件删除，任务记录清除下载链接 |
+| 18 | 同模板并发 10 任务 | 队列正常消化，无任务丢失或重复渲染 |
+
+---
+
+## 13. 关联文档
+
+- 《客户端-错题打印与PDF导出页面架构与交互设计.md》— 客户端发起导出与进度展示
+- 《统一文件生成与异步报表导出中心服务-详细设计.md》— 通用异步文件生成协议（复用其任务进度查询协议）
+- 《答案管控与渐进式提示引擎-详细设计.md》— 练习卷答案管控红线
+- 《教育内容数字版权保护与内容安全分发系统-详细设计.md》— 水印与分发安全
+- 《用户学习画像与能力维度模型-详细设计.md》— 报告数据来源
+- 《数据导出与账户注销服务-详细设计.md》— 注销数据擦除联动
+
+---
+
+**v1.1 维护记录（2026-09-20）**：本文档原版本截断于 §5.1 技术选型表结束处，§5.2 及之后全部缺失。本次补全：§5.1 补选型理由与部署形态、§5.2 七阶段渲染管线图与延迟预算表、§5.3 SectionData 中间模型与聚合器注册表、§5.4 KaTeX 公式渲染与失败兜底、§5.5 图表渲染矩阵、§5.6 打印优化六条、§6 创建时序图与 Worker 处理代码（CAS 抢占/配额同事务）、§6.3 配额预占-确认-释放三段式裁决、§7 七态状态机与守卫 G1-G7 与四层幂等、§8 错误码总表（50500-50599/0305xx 映射）、§9 Outbox 三事件与两上游订阅、§10 监控七指标与 DAU50 万容量估算、§11 合规七条、§12 验收场景 18 条、§13 关联文档。
