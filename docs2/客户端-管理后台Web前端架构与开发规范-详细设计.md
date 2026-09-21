@@ -618,4 +618,490 @@ export const usePermissionStore = create<PermissionState>((set) => ({
       getPermissionCodes(),
     ]);
     set({
-      menus
+      menus: sortMenus(menuRes.data),
+      permissionCodes: new Set(permRes.data),
+      loaded: true,
+    });
+  },
+
+  reset: () => {
+    set({ menus: [], permissionCodes: new Set(), loaded: false });
+  },
+}));
+
+/** 菜单按 sort 字段递归排序 */
+function sortMenus(menus: MenuConfig[]): MenuConfig[] {
+  return menus
+    .sort((a, b) => a.sort - b.sort)
+    .map(m => ({
+      ...m,
+      children: m.children?.length ? sortMenus(m.children) : undefined,
+    }));
+}
+```
+
+#### 3.5.1 菜单渲染与页签联动
+
+侧边栏菜单基于 `menus` 渲染；`keepAlive` 菜单对应组件加入页签缓存白名单，`affix` 菜单（如首页看板）不可关闭。
+
+```typescript
+// src/layouts/Sider.tsx
+
+import { usePermissionStore } from '@/stores/permissionStore';
+import { Menu } from 'antd';
+import { useLocation, useNavigate } from 'react-router-dom';
+
+export function Sider() {
+  const { menus } = usePermissionStore();
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  const items = useMemo(() => convertToMenuItems(menus), [menus]);
+  const selectedKey = location.pathname;
+  const openKeys = findParentKeys(menus, selectedKey);
+
+  return (
+    <Menu
+      mode="inline"
+      theme="dark"
+      items={items}
+      selectedKeys={[selectedKey]}
+      defaultOpenKeys={openKeys}
+      onClick={({ key }) => navigate(key)}
+    />
+  );
+}
+```
+
+> **守卫 G1**：菜单数据以服务端返回为唯一来源（SSOT），前端不硬编码任何角色可见菜单；`hidden=true` 的目录仅作为路由容器不在侧边栏渲染，但仍需经 `RequirePermission` 守卫。
+> **守卫 G2**：`loaded=false` 时侧边栏渲染骨架屏，禁止闪现完整菜单后回跳（防止权限菜单闪烁泄露模块存在性）。
+
+---
+
+## 4. HTTP 请求层
+
+### 4.1 Axios 实例与拦截器
+
+```typescript
+// src/api/client.ts
+
+import axios, { AxiosError, type AxiosRequestConfig } from 'axios';
+import { tokenManager } from '@/utils/auth';
+
+/** 统一响应包装 */
+export interface ApiResponse<T> {
+  code: number;        // 业务码，0 表示成功
+  message: string;
+  data: T;
+  traceId: string;     // 链路追踪 ID
+}
+
+export const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  timeout: 30_000,
+  headers: { 'X-Client-Channel': 'admin-web' },
+});
+
+// ── 请求拦截器：注入 Token ──────────────────────────
+apiClient.interceptors.request.use((config) => {
+  const token = tokenManager.getAccessToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+// ── 响应拦截器：业务码归一 + 401 刷新重试 ─────────────
+apiClient.interceptors.response.use(
+  (response) => {
+    const body = response.data as ApiResponse<unknown>;
+    if (body.code !== 0) {
+      // 业务错误统一抛出，由全局错误边界或调用方处理
+      return Promise.reject(new BusinessError(body.code, body.message, body.traceId));
+    }
+    return response;
+  },
+  async (error: AxiosError) => {
+    const { response, config } = error;
+    if (response?.status === 401 && config && !(config as any)._retried) {
+      (config as any)._retried = true;
+      try {
+        await tokenManager.refresh();
+        return apiClient(config);
+      } catch {
+        tokenManager.logout();
+        return Promise.reject(error);
+      }
+    }
+    return Promise.reject(error);
+  },
+);
+
+export class BusinessError extends Error {
+  constructor(
+    public code: number,
+    message: string,
+    public traceId: string,
+  ) {
+    super(message);
+    this.name = 'BusinessError';
+  }
+}
+```
+
+> **守卫 G3**：401 刷新重试仅允许一次（`_retried` 标记），防止 refreshToken 失效时形成无限重试环。
+> **守卫 G4**：导出/下载类接口超时放宽至 120s（在调用处单独传 `timeout`，不使用全局 30s）。
+
+### 4.2 React Query 服务端状态缓存
+
+```typescript
+// src/api/content/question.ts
+
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { apiClient } from '../client';
+
+export interface QuestionListParams {
+  page: number;
+  pageSize: number;
+  subject?: string;
+  grade?: string;
+  keyword?: string;
+  status?: 'draft' | 'pending' | 'published' | 'rejected';
+}
+
+export function useQuestionList(params: QuestionListParams) {
+  return useQuery({
+    queryKey: ['questions', params],
+    queryFn: async () => {
+      const res = await apiClient.get('/admin/questions', { params });
+      return res.data.data;
+    },
+    placeholderData: (prev) => prev,   // 翻页时保持上一页数据，避免闪烁
+    staleTime: 30_000,
+  });
+}
+
+export function useQuestionCreate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: QuestionCreatePayload) => {
+      const res = await apiClient.post('/admin/questions', payload);
+      return res.data.data;
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['questions'] });
+    },
+  });
+}
+```
+
+---
+
+## 5. 全局状态管理
+
+Zustand 只承载**真正的全局 UI/会话状态**；服务端数据一律走 React Query，禁止双写。
+
+```typescript
+// src/stores/authStore.ts
+
+import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
+import type { AdminUser } from '@/types/permission';
+
+interface AuthState {
+  user: AdminUser | null;
+  setUser: (user: AdminUser) => void;
+  clear: () => void;
+}
+
+export const useAuthStore = create<AuthState>()(
+  persist(
+    (set) => ({
+      user: null,
+      setUser: (user) => set({ user }),
+      clear: () => set({ user: null }),
+    }),
+    {
+      name: 'primetop-admin-auth',
+      // 仅持久化展示字段；权限码以 permissionStore（服务端拉取）为准
+      partialize: (state) => ({ user: state.user }),
+    },
+  ),
+);
+
+// src/stores/appStore.ts —— 折叠态/主题/语言
+// src/stores/tagsStore.ts —— 页签页栈（visitedViews + cachedViews，上限 20，超出淘汰最久未访问）
+```
+
+---
+
+## 6. WebSocket 实时通知
+
+审核状态变更、工单转派、公告发布等事件通过 WS 推送，避免轮询。
+
+```typescript
+// src/hooks/useWebSocket.ts
+
+import { useEffect, useRef, useCallback } from 'react';
+import { tokenManager } from '@/utils/auth';
+import { notification } from 'antd';
+
+type WsMessage =
+  | { type: 'review.task.assigned'; taskId: string; title: string }
+  | { type: 'review.status.changed'; taskId: string; status: string }
+  | { type: 'announcement'; level: 'info' | 'warning'; content: string }
+  | { type: 'ping' };
+
+export function useWebSocket(onMessage?: (msg: WsMessage) => void) {
+  const wsRef = useRef<WebSocket | null>(null);
+  const retryRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  const connect = useCallback(() => {
+    const token = tokenManager.getAccessToken();
+    if (!token) return;
+    const ws = new WebSocket(
+      `${import.meta.env.VITE_WS_BASE_URL}/admin/ws?token=${encodeURIComponent(token)}`,
+    );
+    wsRef.current = ws;
+
+    ws.onopen = () => { retryRef.current = 0; };
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data) as WsMessage;
+      if (msg.type === 'ping') return;
+      if (msg.type === 'announcement') {
+        notification.open({ message: '平台公告', description: msg.content });
+      }
+      onMessage?.(msg);
+    };
+    ws.onclose = () => {
+      // 指数退避重连：1s/2s/4s/… 上限 60s
+      const delay = Math.min(60_000, 1000 * 2 ** retryRef.current++);
+      timerRef.current = setTimeout(connect, delay);
+    };
+  }, [onMessage]);
+
+  useEffect(() => {
+    connect();
+    return () => {
+      clearTimeout(timerRef.current);
+      wsRef.current?.close();
+    };
+  }, [connect]);
+}
+```
+
+> **降级 D1**：WS 连接失败不阻断任何功能——通知中心同时提供手动刷新入口，审核工单列表本身走 HTTP 拉取。
+
+---
+
+## 7. 共享业务组件规范
+
+| 组件 | 职责 | 关键约定 |
+| --- | --- | --- |
+| ProTable | 列表页统一封装 | 内置分页/排序/筛选透传、列设置持久化、导出按钮（权限码 `*:export` 控制） |
+| SchemaForm | Schema 驱动表单 | JSON 描述渲染，支持输入/选择/级联/富文本/上传；校验规则走 zod |
+| RichEditor | 富文本编辑 | 白名单标签过滤（防 XSS），图片走统一上传接口 |
+| PromptEditor | Prompt 模板编辑 | Monaco Editor，支持变量占位符 `{{var}}` 高亮与插入 |
+| ChartContainer | 图表容器 | ECharts 封装，内置空态/加载态/失败重试 |
+| FileUploader | 文件上传 | 分片直传 + 进度展示；限制类型/大小（图片 5MB、文档 50MB） |
+| AuditTrail | 审计轨迹 | 展示操作人/时间/IP/变更 diff（关联服务端审计日志服务） |
+| DataDictionarySelect | 字典选择器 | 基于统一枚举服务缓存，30 分钟本地有效 |
+
+ProTable 使用示例：
+
+```typescript
+// src/pages/content/question/index.tsx
+
+export default function QuestionListPage() {
+  const [params, setParams] = useState<QuestionListParams>({ page: 1, pageSize: 20 });
+  const { data, isLoading } = useQuestionList(params);
+
+  return (
+    <ProTable
+      rowKey="id"
+      loading={isLoading}
+      dataSource={data?.list ?? []}
+      total={data?.total ?? 0}
+      params={params}
+      onParamsChange={setParams}
+      columns={[
+        { title: '题号', dataIndex: 'id', width: 100 },
+        { title: '题干', dataIndex: 'stem', ellipsis: true },
+        { title: '学科', dataIndex: 'subject', width: 90 },
+        { title: '状态', dataIndex: 'status', width: 90, render: statusTag },
+      ]}
+      toolbar={
+        <PermissionWrapper code="content:question:create">
+          <Button type="primary" onClick={() => navigate('/content/question/create')}>
+            新建题目
+          </Button>
+        </PermissionWrapper>
+      }
+    />
+  );
+}
+```
+
+---
+
+## 8. 性能优化
+
+| 手段 | 实现 |
+| --- | --- |
+| 路由级代码分割 | `lazyRoutes` 全部 `React.lazy`，按页面分包 |
+| 组件级按需加载 | Monaco Editor、ECharts 独立 chunk，进入对应页面才加载 |
+| 表格虚拟滚动 | 行数 > 200 时启用 `react-virtualized` |
+| 图片懒加载 | `loading="lazy"` + CDN 缩略图 |
+| 请求去重 | React Query 相同 queryKey 自动去重 |
+| 构建优化 | Vite manualChunks 拆分 antd/echarts/react 三大 vendor |
+
+```typescript
+// vite.config.ts 关键配置
+
+export default defineConfig({
+  build: {
+    target: 'es2018',
+    chunkSizeWarningLimit: 800,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          react: ['react', 'react-dom', 'react-router-dom'],
+          antd: ['antd', '@ant-design/icons'],
+          echarts: ['echarts'],
+          editor: ['monaco-editor'],
+        },
+      },
+    },
+  },
+});
+```
+
+---
+
+## 9. 构建与部署
+
+| 环境 | 命令 | 产物 |
+| --- | --- | --- |
+| 开发 | `pnpm dev` | Vite dev server + 代理至测试网关 |
+| 预发 | `pnpm build:staging` | 静态文件上传 OSS + CDN 刷新 |
+| 生产 | `pnpm build` | 同上，带 sourcemap 上传 Sentry |
+
+- 环境变量：`.env.development / .env.staging / .env.production` 仅含非敏感配置（API 地址、WS 地址、Sentry DSN），密钥一律不下发前端。
+- 版本可见性：登录页右下角展示构建版本号（`import.meta.env.VITE_BUILD_VERSION`），便于问题定位。
+- 回滚：CDN 保留最近 10 个版本目录，回滚仅需切换 CDN 回源路径。
+
+---
+
+## 10. 全局错误处理
+
+| 场景 | 处理 |
+| --- | --- |
+| 路由不存在 | 404 页 + 返回首页入口 |
+| 无权限访问 | 403 页 + 展示所需权限码（便于管理员排查） |
+| 接口业务错误 | message 提示 + traceId 复制按钮 |
+| 未捕获渲染异常 | ErrorBoundary 兜底 + 上报 Sentry |
+| 网络断开 | 顶部横幅「网络连接异常，正在重试…」 |
+
+```typescript
+// src/components/ErrorBoundary/index.tsx
+
+import { Component, type ReactNode } from 'react';
+import { Result, Button } from 'antd';
+
+export class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
+  state = { hasError: false };
+
+  static getDerivedStateFromError() {
+    return { hasError: true };
+  }
+
+  componentDidCatch(error: Error, info: React.ErrorInfo) {
+    // 上报 Sentry（携带当前路由与用户信息）
+    window.Sentry?.captureException(error, { contexts: { react: info } });
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <Result
+          status="500"
+          title="页面出现异常"
+          subTitle="已自动上报，请刷新重试或联系平台管理员"
+          extra={<Button type="primary" onClick={() => location.reload()}>刷新</Button>}
+        />
+      );
+    }
+    return this.props.children;
+  }
+}
+```
+
+---
+
+## 11. 安全规范
+
+| 项 | 规范 |
+| --- | --- |
+| XSS | React 默认转义；富文本经 DOMPurify 白名单过滤；禁止 `dangerouslySetInnerHTML` 直插接口数据 |
+| CSRF | 写操作接口要求 `X-Requested-With` 头；Cookie 全部 `SameSite=Lax` |
+| Token | accessToken 仅内存；refreshToken httpOnly Cookie；登录页开启 HttpOnly Session 校验 |
+| 越权 | 所有敏感操作前端隐藏按钮仅作体验优化，服务端必须二次校验（前端权限不可作为安全边界） |
+| 敏感信息 | 日志、报错信息、URL query 禁止携带 Token/身份证/手机号明文 |
+| 依赖安全 | CI 中 `pnpm audit` 阻断 high/critical 漏洞入库 |
+
+---
+
+## 12. 开发规范
+
+- 提交规范：Conventional Commits（`feat: / fix: / refactor: / chore:`）+ Husky pre-commit 运行 ESLint + Prettier。
+- 目录规范：新增页面必须同步注册路由配置与权限码，禁止散落的游离页面。
+- 命名规范：页面组件 PascalCase；hooks `use` 前缀；API 函数 `use` + 资源名 + 动作。
+- 类型规范：接口出入参必须有 TypeScript 类型，禁止 `any` 透传（ESLint `@typescript-eslint/no-explicit-any` 告警）。
+
+---
+
+## 13. 测试策略
+
+| 层级 | 工具 | 覆盖目标 |
+| --- | --- | --- |
+| 单元测试 | Vitest + Testing Library | 工具函数、Hooks、状态 store |
+| 组件测试 | Testing Library | ProTable/SchemaForm 核心交互 |
+| E2E | Playwright | 登录 → 权限菜单 → 题目 CRUD 主链路 |
+
+CI 门槛：单元测试覆盖率 ≥ 60%，E2E 主链路用例全绿方可合入 main。
+
+---
+
+## 14. 关联文档
+
+- 权限角色与系统安全配置工作台-详细设计.md（服务端权限/菜单接口契约）
+- 服务端统一认证授权与令牌管理体系-详细设计.md（Token 颁发与刷新契约）
+- 客户端组件库与设计系统-详细设计.md（设计 Token 一致性）
+- 服务端审计日志与操作追溯系统-详细设计.md（AuditTrail 数据源）
+- 服务端统一响应封装与分页查询规范-详细设计.md（ApiResponse 包装约定）
+
+---
+
+## 15. 验收场景
+
+1. 无 Token 访问任意后台路由 → 重定向登录页，回跳参数正确。
+2. 登录成功后菜单与后端返回一致，无权限菜单不渲染且直输 URL 返回 403。
+3. Token 过期前 5 分钟自动刷新，期间并发请求仅触发一次刷新。
+4. refreshToken 失效 → 自动登出并回登录页。
+5. 超级管理员可见全部菜单；只读访客编辑按钮全部隐藏。
+6. 断网时页面提示网络异常横幅，恢复后自动重连 WS。
+7. 列表页翻页不闪烁（placeholderData 生效），切换筛选条件 queryKey 隔离。
+8. 构建产物 vendor chunk 缓存命中后二次加载首屏 ≤ 3s（内网）。
+9. 富文本提交 `<script>alert(1)</script>` 被过滤后入库。
+10. 页面抛异常时 ErrorBoundary 兜底并上报，不白屏。
+11. 审核任务 WS 推送 3s 内到达，WS 断连期间可手动刷新列表补数。
+12. 登出后按浏览器前进键不可回到受保护页面。
+---
+
+## 16. 维护记录
+
+| 版本 | 日期 | 变更 |
+| --- | --- | --- |
+| v1.0 | 2026-06 | 初版：§1 概述至 §3.4 路由守卫。 |
+| v1.1 | 2026-09-22 | 补全烂尾文档：原文件 621 行截断于 §3.5 动态菜单加载 `permissionStore.ts` 代码块中段（围栏未闭合，详见 `_rescan_fences_20260921.txt` 记录 ```@L579），§3.5 后半至文末全部缺失。本次补齐：§3.5 收尾（permissionStore 完整实现含 `sortMenus` 递归排序与 reset）与 §3.5.1 菜单渲染与页签联动（Sider.tsx，`keepAlive` 白名单与 `affix` 页签语义）；并续写 §4 HTTP 请求层（Axios 实例与拦截器、React Query 服务端状态缓存）至 §15 验收场景 12 条，覆盖全局状态管理/WS 实时通知/共享业务组件/性能优化/构建部署/全局错误处理/安全规范/开发规范/测试策略/关联文档。核验：CommonMark 围栏 36/36 BALANCED，UTF-8 无 BOM，尾部维护记录完整。 |
