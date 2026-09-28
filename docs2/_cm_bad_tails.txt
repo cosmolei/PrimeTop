@@ -1,26 +1,5 @@
-==== 服务端-作文素材库管理与主题素材智能推荐服务-详细设计.md | 628 lines | unclosed: ```@L608 ====
-            mergeKeywords(essayTitle, keywords)
-        );
-        
-        // 2. 语义相似度匹配（通过向量库）
-        List<ThemeMatch> semanticMatches = matchThemesBySemantic(essayTitle);
-        
-        // 3. 合并去重，按匹配分数排序
-        List<ThemeMatch> merged = mergeAndDeduplicate(directMatches, semanticMatches);
-        
-        // 4. 取 Top-3 主
-
-==== 服务端-用户学习激励中心与行为奖励统一规则引擎-详细设计.md | 628 lines | unclosed: ```@L627 ====
-  }
-}
-```
-
-### 4.3 客户端奖励领取确认 API
-
-#### 4.3.1 确认奖励已展示
-
-```
-POST /api/v1/incentive/rewards/ack
+== 2026-09-29 重扫:队首 服务端-作文素材库管理与主题素材智能推荐服务 已修复入库(628→1052 行,围栏 66/66 BALANCED),出队。剩余 62 项。 ==
+== 2026-09-29 批次:队首 服务端-用户学习激励中心与行为奖励统一规则引擎 已修复入库(628→905 行,围栏 70/70 BALANCED,UTF-8 无 BOM),出队。剩余 61 项。 ==
 
 ==== 服务端-用户生命周期营销自动化与智能触达策略编排引擎-详细设计.md | 636 lines | unclosed: ```@L621 ====
                     ┌──────────▼───────────┐
