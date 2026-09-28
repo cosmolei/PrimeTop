@@ -1,51 +1,3 @@
-==== 服务端-教材修订内容变更检测与平台内容影响评估引擎-详细设计.md | 620 lines | unclosed: ```@L528 ====
-        if (!matchedNew.contains(j)) {
-            changes.add(buildAddedChange(newPoints.get(j)));
-        }
-    }
-
-    return changes;
-}
-
-private static final double KNOWLEDGE_MATCH_THRESHOLD = 0.70;
-private static final double KNOWLEDGE_WEAK_THRESHOLD = 0.50;
-
-==== 客户端-管理后台Web前端架构与开发规范-详细设计.md | 621 lines | unclosed: ```@L579 ====
-  permissionCodes: new Set<string>(),
-  loaded: false,
-
-  loadMenus: async () => {
-    const [menuRes, permRes] = await Promise.all([
-      getMenuTree(),
-      getPermissionCodes(),
-    ]);
-    set({
-      menus
-
-==== 服务端-小学科学探究式学习智能辅导与虚拟实验引导引擎-详细设计.md | 626 lines | unclosed: ```@L572 ====
-    },
-    {
-      "stageIndex": 3,
-      "title": "思考与总结",
-      "guidance": "思考：要让灯泡发光，电路需要满足什么条件？如果断开一处导线，灯泡还会亮吗？",
-      "interactiveType": "reflection_questions",
-      "questions": [
-        "电路中不可缺少的部分有哪些？",
-        "开关的作用是什么？",
-        "如果再加一
-
-==== 服务端-AI对话安全审计与敏感内容自动上报服务-详细设计.md | 628 lines | unclosed: ```@L557 ====
-        │     ┌───────────────┐
-        │     │ 审计日志记录    │
-        │     │ 用户画像更新    │
-        │     │ 工单/通知发送    │
-        │     └───────────────┘
-        │
-        ▼
-   返回扫描结果给调用方
-   (AI对话引擎根据结果
-    决定是否放行/替换/拦截)
-
 ==== 服务端-作文素材库管理与主题素材智能推荐服务-详细设计.md | 628 lines | unclosed: ```@L608 ====
             mergeKeywords(essayTitle, keywords)
         );
@@ -81,30 +33,6 @@ POST /api/v1/incentive/rewards/ack
               ┌────────────────┼────────────────┐
               │                │                │
               
-
-==== 英语语法专项训练系统-详细设计.md | 637 lines | unclosed: ```@L631 ====
-请求 AI 对某题/某语法点进行详细讲解。
-
-**请求：**
-```json
-{
-  "question_id": 2001,                // 题目ID（与kp_id二选一）
-  "knowledge_point_id": null,         // 知识点ID
-  "user_answer": "go",                // 用户答案（错题讲解时传入）
-  "explanation_depth": "detailed",    // brief/detailed/deep
-  "include_contrast": true            // 是否包含易混对比
-
-==== 服务端-AI对话追问拓展与多轮交互响应编排引擎-详细设计.md | 643 lines | unclosed: ```@L605 ====
-    },
-    
-    FollowUpAction.GIVE_EXAMPLE: {
-        "strategy_tag": "follow_up_example",
-        "system_instruction": (
-            "你是一个善于举例的老师。学生希望看到具体的例子来帮助理解。\n"
-            "要求：\n"
-            "1. 提供 2-3 个由浅入深的例子\n"
-            "2. 第一个例子用最简单、最生活化的场景\n"
-            "3. 逐步增加复杂度，最后一个贴近考试题目
 
 ==== 服务端统一数据对账与跨服务一致性校验引擎-详细设计.md | 644 lines | unclosed: ```@L537 ====
             }
@@ -537,18 +465,6 @@ class BatchVerificationController:
     BATCH_SIZE = 50
     AI_RATE_LIMIT = 3  # AI策略最大并发
     CALC_RATE_LIMIT = 10  # 计算
-
-==== 客户端-成就勋章与奖励展示组件-详细设计.md | 908 lines | unclosed: ```@L720 ====
-  }
-
-  Color _tierColor(int tier) {
-    switch (tier) {
-      case 1: return const Color(0xFFCD7F32); // 铜
-      case 2: return const Color(0xFFC0C0C0); // 银
-      case 3: return const Color(0xFFFFD700); // 金
-      case 4: return const Color(0xFFE5E4E2); // 铂金
-      case 5: return const Color(0xFFB9F2FF); // 钻石
-      default: return Colors.grey
 
 ==== 服务端通用数据导入服务与批量操作引擎-详细设计.md | 929 lines | unclosed: ```@L779 ====
                         error_code="FIELD_REQUIRED", field_name=f,
