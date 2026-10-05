@@ -1,4 +1,5 @@
-﻿== 2026-10-05 批次(二):队首 服务端-学段衔接知识桥梁课程与过渡期学习指导引擎 已修复入库(648->1496 行,围栏 50/50 BALANCED,UTF-8 无 BOM),出队;新队首:服务端-用户转化漏斗分析与增长归因引擎 649@L600 ==
+﻿== 2026-10-05 批次(三):队首 服务端-用户转化漏斗分析与增长归因引擎 已修复入库(578→917 行,围栏 BALANCED,UTF-8 无 BOM),出队;新队首:用户协议与法律文档管理服务 655@L536 ==
+== 2026-10-05 批次(二):队首 服务端-学段衔接知识桥梁课程与过渡期学习指导引擎 已修复入库(648->1496 行,围栏 50/50 BALANCED,UTF-8 无 BOM),出队;新队首:服务端-用户转化漏斗分析与增长归因引擎 649@L600 ==
 == 2026-09-29 批次(五):队首 服务端统一数据对账与跨服务一致性校验引擎 已修复入库(644->1521 行,围栏 42/42 BALANCED,UTF-8 无 BOM),出队。 ==
 
 == 2026-09-29 批次(四):核验入库上轮中断未提交的 Pulse v1.1 工作区成果(1441 行,围栏 36/36 BALANCED,UTF-8 无 BOM);队列正文上轮丢失,本轮 _cm_fence_check 重跑全量重建(69 项,队首 服务端统一数据对账与跨服务一致性校验引擎 644@L537) ==
@@ -33,18 +34,6 @@
           "week": 9,
           "task_type": "learning_habits",
           "topic": "初中学习
-
-==== 服务端-用户转化漏斗分析与增长归因引擎-详细设计.md | 649 lines | unclosed: ```@L600 ====
-    },
-    "consensus_ranking": [
-      {"rank": 1, "touchpoint_module": "ai_tutor", "avg_rank_score": 1.0},
-      {"rank": 2, "touchpoint_module": "photo_search", "avg_rank_score": 2.0},
-      {"rank": 3, "touchpoint_module": "mistake_book", "avg_rank_score": 3.25},
-      {"rank": 4, "touchpoint_module": "study_plan", "avg_rank_score": 4.0},
-      {"rank": 5, "touchpoint_module": "sync_class", "avg_rank_score": 4.25},
-      {"rank": 6, "touchpoint_module": "exam_prep", "avg_rank_score": 5.5}
-    ],
-    "insight": "AI辅导功能是最大的转化驱动力（多模型一致排名第1
 
 ==== 用户协议与法律文档管理服务-详细设计.md | 655 lines | unclosed: ```@L536 ====
         # 对于必要文档，拒绝 = 无法使用 APP
