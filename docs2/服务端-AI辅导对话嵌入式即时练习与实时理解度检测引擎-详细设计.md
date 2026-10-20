@@ -699,4 +699,605 @@ class ComprehensionCalculator:
         - 先验: Beta(α, β)，其中 α/(α+β) = prior_mastery
         - 练习正确: α += w_practice
         - 练习错误: β += w_practice
-        - 对话信号: 根据
+        - 对话信号: 根据信号方向微调 α/β (正向信号加 α, 负向信号加 β)
+
+        置信度由证据数量与证据一致性共同决定:
+        - 证据越多、越一致 → 置信度越高
+        - 练习结果与对话信号矛盾 → 置信度下降, 得分向先验回缩
+        """
+
+    # 先验强度: 等效样本量, 防止单次练习大幅翻转评估
+    PRIOR_STRENGTH = 8.0
+    # 各证据权重 (经验标定, 可通过实验平台回归调整)
+    PRACTICE_WEIGHT_CORRECT = 3.0
+    PRACTICE_WEIGHT_PARTIAL = 1.0
+    PRACTICE_WEIGHT_INCORRECT = 2.5
+    PRACTICE_WEIGHT_SKIPPED = 0.0   # 跳过不提供证据 (红线 G2)
+    DIALOGUE_SIGNAL_WEIGHT_MAX = 1.5
+    # 证据矛盾时向先验回缩的比例
+    CONTRADICTION_SHRINK = 0.5
+
+    def calculate(
+        self,
+        practice_result: PracticeEvaluation,
+        dialogue_signals: list[DialogueSignal],
+        prior_mastery: float,
+        student_profile: StudentProfile
+    ) -> ComprehensionAssessment:
+        # 初始化 Beta 先验 (共轭先验 α,β ≥ 1)
+        alpha = prior_mastery * self.PRIOR_STRENGTH + 1.0
+        beta = (1.0 - prior_mastery) * self.PRIOR_STRENGTH + 1.0
+
+        evidence_count = 0
+        evidence_directions: list[int] = []  # +1 正向 / -1 负向 / 0 中性
+
+        # ── 证据 1: 嵌入式练习结果 (权重最高) ──
+        w_practice = self._practice_weight(practice_result.status)
+        if w_practice > 0:
+            evidence_count += 1
+            if practice_result.status == AnswerStatus.CORRECT:
+                alpha += w_practice
+                evidence_directions.append(+1)
+            elif practice_result.status == AnswerStatus.PARTIAL:
+                alpha += self.PRACTICE_WEIGHT_PARTIAL
+                beta += self.PRACTICE_WEIGHT_PARTIAL
+                evidence_directions.append(0)
+            elif practice_result.status == AnswerStatus.INCORRECT:
+                beta += w_practice
+                evidence_directions.append(-1)
+            # SKIPPED / TIMEOUT: 不加证据 (G2 红线)
+
+        # ── 证据 2: 对话行为信号 (多信号融合) ──
+        signal_alpha, signal_beta, signal_count, signal_dirs = \
+            self._fuse_dialogue_signals(dialogue_signals)
+        alpha += signal_alpha
+        beta += signal_beta
+        evidence_count += signal_count
+        evidence_directions.extend(signal_dirs)
+
+        # 后验均值
+        score = alpha / (alpha + beta)
+
+        # 证据矛盾检测: 方向既有 +1 又有 -1 时向先验回缩
+        if +1 in evidence_directions and -1 in evidence_directions:
+            score = prior_mastery + (score - prior_mastery) * self.CONTRADICTION_SHRINK
+
+        confidence = self._calc_confidence(
+            evidence_count=evidence_count,
+            directions=evidence_directions,
+            practice_status=practice_result.status
+        )
+
+        return ComprehensionAssessment(
+            score=round(min(1.0, max(0.0, score)), 3),
+            confidence=round(confidence, 3),
+            evidence_count=evidence_count,
+            prior_mastery=prior_mastery,
+            evidence_summary={
+                'practice_status': practice_result.status.value,
+                'signal_count': signal_count,
+                'contradiction_detected': (+1 in evidence_directions and -1 in evidence_directions),
+            }
+        )
+
+    def _practice_weight(self, status: AnswerStatus) -> float:
+        return {
+            AnswerStatus.CORRECT: self.PRACTICE_WEIGHT_CORRECT,
+            AnswerStatus.PARTIAL: self.PRACTICE_WEIGHT_PARTIAL,
+            AnswerStatus.INCORRECT: self.PRACTICE_WEIGHT_INCORRECT,
+            AnswerStatus.SKIPPED: self.PRACTICE_WEIGHT_SKIPPED,
+            AnswerStatus.TIMEOUT: self.PRACTICE_WEIGHT_SKIPPED,
+        }[status]
+
+    def _fuse_dialogue_signals(
+        self, signals: list[DialogueSignal]
+    ) -> tuple[float, float, int, list[int]]:
+        """对话行为信号融合, 总权重封顶 DIALOGUE_SIGNAL_WEIGHT_MAX"""
+        alpha_add, beta_add, count, dirs = 0.0, 0.0, 0, []
+        total_w = 0.0
+        for sig in sorted(signals, key=lambda s: -abs(s.weight)):
+            if total_w >= self.DIALOGUE_SIGNAL_WEIGHT_MAX:
+                break
+            w = min(abs(sig.weight), self.DIALOGUE_SIGNAL_WEIGHT_MAX - total_w)
+            total_w += w
+            count += 1
+            if sig.direction > 0:
+                alpha_add += w
+                dirs.append(+1)
+            elif sig.direction < 0:
+                beta_add += w
+                dirs.append(-1)
+            else:
+                alpha_add += w / 2
+                beta_add += w / 2
+                dirs.append(0)
+        return alpha_add, beta_add, count, dirs
+
+    def _calc_confidence(
+        self,
+        evidence_count: int,
+        directions: list[int],
+        practice_status: AnswerStatus
+    ) -> float:
+        """
+        置信度规则:
+        - 基础值 0.5, 每增加一条证据 +0.1 (上限 +0.3)
+        - 有练习直接证据额外 +0.15
+        - 证据矛盾 -0.25
+        - 跳过/超时无证据时置信度 = 0 (不产出评估, 由调用方丢弃)
+        """
+        if evidence_count == 0:
+            return 0.0
+        conf = 0.5 + min(0.3, evidence_count * 0.1)
+        if practice_status in (AnswerStatus.CORRECT, AnswerStatus.PARTIAL, AnswerStatus.INCORRECT):
+            conf += 0.15
+        if +1 in directions and -1 in directions:
+            conf -= 0.25
+        return min(1.0, max(0.1, conf))
+```
+
+#### 4.3.2 对话行为信号定义与权重
+
+| 信号编码 | 信号含义 | 判定方式 | 方向 | 权重 |
+| --- | --- | --- | --- | --- |
+| FOLLOW_UP_RELEVANT | 学生追问与当前知识点高相关 | 意图分类器 (委托 NLP 管线) | +1 | 0.6 |
+| FOLLOW_UP_IRRELEVANT | 学生追问与当前知识点无关 | 意图分类器 | -1 | 0.5 |
+| SPONTANEOUS_RESTATEMENT | 学生自发复述/举例应用 | 对话内容分析 | +1 | 0.8 |
+| CONFIRMATORY_STATEMENT | 确认性表述("原来如此"/"明白了") | 词典+分类器 | +1 | 0.3 |
+| HESITATION_MARKER | 犹豫表述("不太懂"/"有点懵") | 词典+分类器 | -1 | 0.8 |
+| FAST_CORRECT_ANSWER | 作答耗时显著低于预估 (≤50%) | 作答日志 | +1 | 0.4 |
+| SLOW_ANSWER | 作答耗时显著高于预估 (≥300%) | 作答日志 | -1 | 0.3 |
+| EMOTION_FRUSTRATED | 情感感知引擎判定沮丧 | 只读订阅 (权威归情感引擎) | -1 | 0.9 |
+
+信号提取红线:
+- **G-信号只读**: 情感信号以订阅方式从情感感知引擎获取, 本引擎不自行做情感分析, 避免双写者冲突 (契约 R4)。
+- **词典时效**: 犹豫/确认词典每季度由教研复核, 防止网络用语漂移导致误判。
+
+### 4.4 辅导策略推荐器
+
+策略推荐器将理解度评估结果映射为后续对话策略, 输出给对话编排引擎执行。
+
+#### 4.4.1 策略决策表
+
+| 理解度得分 | 置信度 | 练习状态 | 推荐策略 | 说明 |
+| --- | --- | --- | --- | --- |
+| ≥ 0.85 | ≥ 0.7 | CORRECT | MOVE_TO_NEXT_TOPIC | 理解良好, 可推进 |
+| ≥ 0.85 | ≥ 0.7 | CORRECT (连续第2次) | GENERATE_HARDER_QUESTION | 挑战更高难度巩固 |
+| 0.60 - 0.85 | ≥ 0.6 | 任意有效作答 | CONTINUE_CURRENT_TOPIC | 基本理解, 继续深化 |
+| 0.35 - 0.60 | ≥ 0.6 | 任意有效作答 | RE_EXPLAIN_DIFFERENTLY | 部分理解, 换种讲法 |
+| < 0.35 | ≥ 0.6 | INCORRECT | PROVIDE_SIMPLER_EXAMPLE + 前置知识检测 | 理解薄弱, 先补前置 |
+| 任意 | ≥ 0.6 | INCORRECT (同KP连续第2次) | FLAG_FOR_REVIEW | 标记顽固薄弱点, 进入复习调度 |
+| 任意 | < 0.6 | 任意 | CONTINUE_CURRENT_TOPIC | 低置信不动作, 避免误判 (红线 G2) |
+| — | — | SKIPPED / TIMEOUT | 不推断, 仅记录 | 跳过/超时不是理解力证据 |
+
+```python
+class StrategyRecommender:
+    """辅导策略推荐器: 基于理解度评估结果推荐后续对话策略"""
+
+    def recommend(
+        self,
+        assessment: ComprehensionAssessment,
+        practice_result: PracticeEvaluation,
+        context: DialogueContext,
+        consecutive_low_count: int   # 同知识点连续低分次数
+    ) -> RecommendedStrategy:
+
+        score, conf = assessment.score, assessment.confidence
+        status = practice_result.status
+
+        # 跳过/超时: 不作推断
+        if status in (AnswerStatus.SKIPPED, AnswerStatus.TIMEOUT):
+            return RecommendedStrategy(
+                action=NextActionType.CONTINUE_CURRENT_TOPIC,
+                reason='SKIPPED_NO_INFERENCE',
+                degrade_trigger_cooldown=True   # 跳过则本次对话内降频
+            )
+
+        # 低置信: 不动作
+        if conf < 0.6:
+            return RecommendedStrategy(
+                action=NextActionType.CONTINUE_CURRENT_TOPIC,
+                reason='LOW_CONFIDENCE_NO_ACTION'
+            )
+
+        # 连续低分: 顽固薄弱点标记
+        if consecutive_low_count >= 2 and status == AnswerStatus.INCORRECT:
+            return RecommendedStrategy(
+                action=NextActionType.FLAG_FOR_REVIEW,
+                reason='PERSISTENT_LOW_PERFORMANCE',
+                payload={'knowledge_point_id': context.knowledge_point_id}
+            )
+
+        if score >= 0.85:
+            if context.consecutive_correct_count >= 2:
+                return RecommendedStrategy(
+                    action=NextActionType.GENERATE_HARDER_QUESTION,
+                    reason='HIGH_COMPREHENSION_CHALLENGE'
+                )
+            return RecommendedStrategy(
+                action=NextActionType.MOVE_TO_NEXT_TOPIC,
+                reason='HIGH_COMPREHENSION'
+            )
+        elif score >= 0.60:
+            return RecommendedStrategy(
+                action=NextActionType.CONTINUE_CURRENT_TOPIC,
+                reason='MODERATE_COMPREHENSION'
+            )
+        elif score >= 0.35:
+            return RecommendedStrategy(
+                action=NextActionType.RE_EXPLAIN_DIFFERENTLY,
+                reason='PARTIAL_COMPREHENSION',
+                payload={'explain_style': 'analogy'}   # 默认类比讲法
+            )
+        else:
+            return RecommendedStrategy(
+                action=NextActionType.PROVIDE_SIMPLER_EXAMPLE,
+                reason='LOW_COMPREHENSION',
+                payload={'check_prerequisites': True}   # 触发前置知识检测
+            )
+```
+
+#### 4.4.2 连续低分计数与顽固薄弱点
+
+- 计数口径: 同一 `knowledge_point_id` 在自然日内的嵌入式练习 INCORRECT 次数, Redis 计数器 `idep:lowcnt:{student_id}:{kp_id}` TTL 至当日 24:00。
+- `FLAG_FOR_REVIEW` 策略执行时, 向复习调度引擎发送 `kp.review.flagged` 事件, 由复习调度引擎决定进入间隔重复队列, 本引擎不直接操作复习计划 (契约 R10)。
+- 顽固薄弱点**不自动进入错题本**: 嵌入式练习为碎片化检测, 题目由 AI 临时生成, 与正式测评错题性质不同, 避免错题本污染 (契约 R6)。
+
+---
+
+## 5. 核心流程
+
+### 5.1 主链路时序
+
+```mermaid
+sequenceDiagram
+    participant S as 学生端
+    participant ORCH as AI对话编排引擎
+    participant TD as 练习触发决策器
+    participant QG as 题目动态生成器
+    participant AE as 作答评估器
+    participant CC as 理解度计算器
+    participant SR as 策略推荐器
+    participant KTE as 知识追踪引擎(异步)
+
+    ORCH->>TD: 每轮回答完成后 evaluate(triggerContext)
+    TD-->>ORCH: TriggerDecision(should_trigger=false) [多数轮次]
+    Note over ORCH,TD: 冷却期/硬约束/分数未达阈值 → 直接返回
+
+    ORCH->>TD: evaluate(triggerContext) — 分数≥阈值
+    TD-->>ORCH: TriggerDecision(should_trigger=true, reason)
+    ORCH->>QG: generate(context, kp, profile, trigger)
+    QG->>QG: 三阶段管线(模板约束+LLM生成+安全校验)
+    QG-->>ORCH: EmbeddedQuestion (P95 ≤ 2s)
+    ORCH->>S: 回答流中插入练习卡片(renderHint)
+    S->>ORCH: 提交作答(answer + clientRequestId)
+    ORCH->>AE: evaluate(practiceId, studentAnswer)
+    AE-->>ORCH: PracticeEvaluation(status, correctnessScore)
+    ORCH->>CC: calculate(practiceResult, dialogueSignals, priorMastery)
+    CC-->>ORCH: ComprehensionAssessment(score, confidence)
+    ORCH->>SR: recommend(assessment, practiceResult, context, lowCount)
+    SR-->>ORCH: RecommendedStrategy(action)
+    ORCH->>ORCH: 执行策略(继续/换讲法/标记), 同事务写 Outbox
+    ORCH-->>KTE: idep.practice.answered 事件(异步消费)
+```
+
+### 5.2 延迟预算
+
+| 阶段 | 预算 | 说明 |
+| --- | --- | --- |
+| 触发决策 | ≤ 10ms | 纯规则计算 + Redis 冷却查询 |
+| 题目生成 (LLM) | ≤ 1500ms P95 | 快速模型, JSON 模式, max_tokens=500 |
+| 答案交叉验算 | ≤ 400ms P95 | 与生成并行不可行(依赖生成结果), 但可与渲染并行 |
+| 练习卡片渲染下发 | ≤ 100ms | 由编排引擎合入 SSE 流 |
+| 作答评估 | ≤ 800ms P95 | 客观题本地匹配 ≤ 50ms, 主观题语义判定走 LLM |
+| 理解度计算+策略推荐 | ≤ 25ms | 纯计算 |
+| **端到端 (生成→卡片出现)** | **≤ 2000ms P95** | 预算主指标 |
+
+超时处理: 题目生成超过 2500ms 仍未返回 → 放弃本次触发 (标记 `GENERATION_TIMEOUT`), 对话继续, 不阻塞主链路 (红线 G1)。
+
+### 5.3 DDL 增补
+
+#### 5.3.1 事件 Outbox 表 `idep_outbox`
+
+```sql
+CREATE TABLE idep_outbox (
+    id              BIGINT PRIMARY KEY AUTO_INCREMENT,
+    event_id        VARCHAR(64) NOT NULL COMMENT '事件唯一ID(UUID)',
+    event_type      VARCHAR(60) NOT NULL COMMENT '事件类型',
+    aggregate_id    VARCHAR(36) NOT NULL COMMENT '聚合ID(practice_id)',
+    conversation_id VARCHAR(36) NOT NULL,
+    student_id      BIGINT NOT NULL,
+    payload         JSON NOT NULL COMMENT '事件负载',
+    occurred_at     DATETIME(3) NOT NULL COMMENT '业务发生时间',
+    published_at    DATETIME(3) NULL COMMENT '发布成功时间',
+    retry_count     INT NOT NULL DEFAULT 0,
+    next_retry_at   DATETIME(3) NULL,
+    status          VARCHAR(15) NOT NULL DEFAULT 'PENDING' COMMENT 'PENDING/PUBLISHED/FAILED',
+
+    UNIQUE KEY uk_event_id (event_id),
+    INDEX idx_status_retry (status, next_retry_at),
+    INDEX idx_conversation (conversation_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='嵌入式练习域事件Outbox';
+```
+
+#### 5.3.2 Redis 键设计
+
+| 键模式 | 类型 | TTL | 用途 |
+| --- | --- | --- | --- |
+| `idep:cooldown:{conversation_id}` | String | 2 轮对话生命周期(≤30min) | 触发冷却标记 |
+| `idep:genlock:{turn_id}:{reason}` | String(SETNX) | 30s | 同轮次同原因生成去重 |
+| `idep:lowcnt:{student_id}:{kp_id}` | Counter | 至当日 24:00 | 连续低分计数 |
+| `idep:answer:{practice_id}` | String | 10min | 作答提交幂等窗口 |
+| `idep:strat:{practice_id}` | String | 1h | 策略已下发防重 |
+
+---
+
+## 6. 状态机与守卫
+
+### 6.1 练习记录状态机
+
+```
+                 ┌──────────────┐
+   生成成功 ───► │   PENDING    │ ◄── 练习卡片已下发, 等待作答
+                 └──────┬───────┘
+        ┌───────────────┼───────────────────────┐
+        ▼               ▼                       ▼
+  ┌───────────┐   ┌────────────┐        ┌────────────┐
+  │ ANSWERED  │   │  SKIPPED   │        │  TIMEOUT   │
+  │(CORRECT/  │   │ (学生跳过)  │        │ (90s未作答) │
+  │ PARTIAL/  │   └─────┬──────┘        └─────┬──────┘
+  │ INCORRECT)│         │                     │
+  └─────┬─────┘         ▼                     ▼
+        ▼        ┌────────────┐        ┌────────────┐
+  ┌───────────┐  │   CLOSED   │        │   CLOSED   │
+  │ EVALUATED │  │ (无评估产出) │        │ (无评估产出) │
+  │(理解度已算)│  └────────────┘        └────────────┘
+  └─────┬─────┘
+        ▼
+  ┌──────────────┐      会话归档时未作答的 PENDING 记录
+  │   CLOSED     │ ───► 批量流转为 EXPIRED (对账兜底)
+  │(策略已下发)   │
+  └──────────────┘
+```
+
+状态流转守卫:
+
+| 守卫 | 规则 | 违反后果 |
+| --- | --- | --- |
+| G1 | 状态迁移一律 CAS (`UPDATE ... WHERE answer_status='PENDING'`), 并发作答/跳过仅一条成功 | 失败方返回 51805 ALREADY_ANSWERED, 客户端幂等吞掉 |
+| G2 | SKIPPED/TIMEOUT 后续禁止产出理解度评分, 禁止负向掌握度推断 | 评估器直接短路返回 |
+| G3 | 仅 EVALUATED → CLOSED 允许携带策略字段更新 | 其他路径更新 strategy 字段抛异常 |
+| G4 | 会话归档 Job 仅能将 PENDING → EXPIRED, 不得触碰其他状态 | 审计日志记录 |
+
+### 6.2 触发状态机 (对话级)
+
+| 状态 | 含义 | 进入条件 |
+| --- | --- | --- |
+| IDLE | 本轮不触发 | 分数<阈值或冷却中 |
+| GENERATING | 正在生成题目 | SETNX 生成锁成功 |
+| RENDERED | 卡片已下发 | 题目通过校验并入流 |
+| AWAITING_ANSWER | 等待作答 | 卡片送达 (客户端 ACK) |
+| CONSUMED | 本轮练习闭环完成 | 评估+策略执行完成 |
+| ABANDONED | 生成失败/超时放弃 | 生成异常或超时, 不计触发次数 |
+
+守卫:
+- **G5**: ABANDONED 不计入"单对话最大 5 次"配额 (仅成功下发的练习计数)。
+- **G6**: GENERATING 状态 Redis 锁 30s 未释放自动过期, 防死锁; 同轮次同原因重复触发直接复用结果。
+
+### 6.3 全局守卫总表
+
+| 编号 | 守卫 |
+| --- | --- |
+| G1 | **对话主链路永不阻塞**: 本引擎任何失败(生成/验算/评估)一律降级或放弃, 不得中断 AI 回答主流 (fail-open) |
+| G2 | **跳过/超时不是负面证据**: SKIPPED/TIMEOUT 不作"不理解"推断, 不降低任何画像分数 |
+| G3 | **掌握度写操作唯一权威=知识追踪引擎**: 本引擎只发事件, 不直接写掌握度表 |
+| G4 | **单对话练习 ≤5 次为硬约束**: 规则配置不可突破, 管理端修改需双人审批 |
+| G5 | 生成失败不计配额 |
+| G6 | 生成锁防死锁 |
+| G7 | Outbox 与业务表同事务写入, 禁止事后补写 |
+| G8 | **学生端不展示理解度数值与标签** (如"你的理解度 62%"), 仅呈现策略动作(换种讲法/继续), 防标签化焦虑 |
+| G9 | 情绪 FRUSTRATED 时禁止触发练习 (fail-closed 仅对触发器生效) |
+| G10 | 低置信评估(conf<0.6)不产生策略变更, 仅记录日志 |
+
+---
+
+## 7. 幂等与并发
+
+| 场景 | 幂等机制 | 竞态裁决 |
+| --- | --- | --- |
+| 学生重复提交作答 | `idep:answer:{practice_id}` SETNX 10min 窗口 + 表级 CAS (PENDING→终态) | 首个成功, 其余返回已存结果 (200 语义) |
+| 客户端重试携带 clientRequestId | 请求日志表 uk(client_request_id), 重放返回原响应 | — |
+| 同轮次同原因重复触发 | `idep:genlock:{turn_id}:{reason}` SETNX | 后者复用前者结果, 不二次调用 LLM |
+| 生成回调与超时放弃竞态 | 超时放弃先写 ABANDONED, 生成成功后到达时校验状态, 已 ABANDONED 则丢弃结果 | 放弃优先, 结果丢弃 |
+| 评估与跳过并发 | CAS 抢状态, 仅一成功 | 先到先得 |
+| 事件重发 | Outbox uk(event_id) + 消费方业务幂等键 | 消费方去重 |
+| 连续低分计数并发 | Redis INCR 原子 | 天然原子 |
+| 会话归档与作答补交 | 归档仅处理 PENDING→EXPIRED; 补交到达时状态已 EXPIRED → 拒绝并提示对话已结束 (51806) | 归档优先, 补交拒绝 |
+
+---
+
+## 8. 事件设计
+
+### 8.1 Outbox 事件 (idep.domain.events)
+
+| 事件 | 触发时机 | 关键负载 | 消费方 |
+| --- | --- | --- | --- |
+| `idep.practice.created` | 练习卡片成功下发 | practice_id, kp_id, question_type, difficulty | 埋点平台, 监控 |
+| `idep.practice.answered` | 作答评估完成 | practice_id, status, correctness_score, answer_time_ms | **知识追踪引擎(掌握度增量)**, 学情分析, 对话编排(上下文) |
+| `idep.comprehension.assessed` | 理解度评估产出 | practice_id, score, confidence, evidence_summary | 知识追踪引擎, 学情报告, 学习干预编排 |
+| `idep.strategy.executed` | 策略执行完成 | practice_id, action, reason | 对话编排, 埋点 |
+| `kp.review.flagged` | FLAG_FOR_REVIEW | kp_id, consecutive_low_count | 复习调度引擎 |
+
+### 8.2 上游订阅
+
+| 事件 | 用途 |
+| --- | --- |
+| `conversation.started` | 初始化对话级触发状态/冷却 |
+| `conversation.ended` | 归档清理 PENDING 记录 → EXPIRED, 释放 Redis 键 |
+| `user.account.deleted` | 按账号删除本域数据 (关联合规 C6) |
+
+### 8.3 消费契约
+
+- 知识追踪引擎消费 `idep.practice.answered` 时按 "证据权重 0.6 (弱于正式测评 1.0)" 计入掌握度增量, 具体融合公式权威归知识追踪引擎 (契约 R3), 本事件仅提供原始证据。
+- 所有事件携带 `occurred_at` 与 `event_id`, 消费方按 event_id 幂等。
+
+---
+
+## 9. 错误码
+
+本域错误码段位 **51800-51899** (全库扫描确认空闲)。均为内部码, 不透传客户端; 客户端仅感知"练习插入失败→无卡片"或通用重试提示。
+
+| 错误码 | 名称 | 处置 |
+| --- | --- | --- |
+| 51801 | IDEPE_GENERATION_FAILED | LLM 生成失败, 重试 1 次后 ABANDONED |
+| 51802 | IDEPE_QUALITY_CHECK_FAILED | 质量校验未过, 重试 1 次后 ABANDONED |
+| 51803 | IDEPE_VERIFICATION_UNAVAILABLE | 交叉验算模型不可用, 单模型结果标记低置信降权使用 |
+| 51804 | IDEPE_PRACTICE_NOT_FOUND | 查询不到练习记录 |
+| 51805 | IDEPE_ALREADY_ANSWERED | 重复作答, 幂等返回原结果 |
+| 51806 | IDEPE_CONVERSATION_NOT_ACTIVE | 会话已结束/归档, 拒绝补交 |
+| 51807 | IDEPE_STRATEGY_DISPATCH_FAILED | 策略下发编排失败, 事件重试, 不阻塞对话 |
+| 51808 | IDEPE_COMPREHENSION_CALC_FAILED | 理解度计算异常, 降级仅使用练习正确性, 标记低置信 |
+| 51809 | IDEPE_RULE_EVAL_FAILED | 规则引擎求值异常, 默认不触发 (fail-closed 对触发) |
+| 51810 | IDEPE_BANK_RETRIEVE_FAILED | 题库检索兜底失败, 转 LLM 生成 |
+| 51811 | IDEPE_KP_CONTEXT_MISSING | 当前对话无明确知识点, 不触发练习 |
+| 51812 | IDEPE_RATE_LIMITED | LLM 生成限流, 放弃本次触发 |
+| 51813 | IDEPE_CONTENT_SAFETY_REJECTED | 生成内容安全校验拒绝, 丢弃不计配额 |
+
+---
+
+## 10. 降级矩阵
+
+| 编号 | 故障场景 | 降级策略 | 恢复 |
+| --- | --- | --- | --- |
+| D1 | LLM 生成超时/失败 | 重试 1 次 → 模板题兜底 → 题库检索兜底 → 放弃 (51801/51812) | 熔断半开探测 |
+| D2 | 质量交叉验算不可用 | 单模型生成结果直接过基础校验, confidence 上限 0.5 (51803) | 探测恢复 |
+| D3 | 内容安全服务不可用 | **fail-closed: 未过安全校验的题目一律不下发**, 宁可不触发 (51813) | 服务恢复 |
+| D4 | 理解度计算异常 | 降级为仅按练习正确性二值判断, 策略推荐退化为规则表 (51808) | 自动 |
+| D5 | 规则引擎不可用 | 默认不触发练习, 对话主链路不受影响 (51809) | 自动 |
+| D6 | Redis 不可用 | 冷却/计数降级为本地内存 (单实例语义弱化, 可接受) + DB 唯一约束兜底 | 自动 |
+| D7 | Outbox 发布失败 | 本地重试 3 次指数退避, 仍失败进死信表人工处理, 业务不受影响 | 人工+自动 |
+| D8 | 学生画像服务超时 | 使用默认难度 0.5 生成, 评估先验用全局年级均值 | 自动 |
+| D9 | 事件总线不可用 | Outbox 积压, 恢复后按 occurred_at 顺序补发 | 自动 |
+| D10 | **总红线** | 任何降级不得阻塞 AI 对话主链路、不得向学生暴露引擎内部故障细节、不得降低内容安全标准 | — |
+
+---
+
+## 11. 监控指标与容量
+
+### 11.1 核心指标 (M1-M10)
+
+| 编号 | 指标 | 口径 | 告警阈值 |
+| --- | --- | --- | --- |
+| M1 | 端到端生成延迟 | 触发→卡片出现 P95 | > 2s 持续 10min |
+| M2 | 练习完成率 | 有效作答 / 已下发 | < 70% 持续 1h |
+| M3 | 练习跳过率 | SKIPPED / 已下发 | > 30% 持续 1h (说明触发时机差) |
+| M4 | 生成失败率 | ABANDONED / 触发次数 | > 10% 持续 30min P2 |
+| M5 | 理解度-测评相关系数 | 每周离线计算 (核心目标 ≥0.75) | < 0.6 触发教研复核 |
+| M6 | 单对话平均练习数 | 全量均值 | > 4 说明规则过激进 |
+| M7 | Outbox 积压量 | PENDING 超 5min 事件数 | > 1000 P2 |
+| M8 | 安全拒绝率 | 51813 / 生成次数 | 突增 3 倍告警 (Prompt 被污染信号) |
+| M9 | LLM 生成成本 | 元/千次触发 | 超预算 120% |
+| M10 | 策略执行成功率 | executed / recommended | < 95% |
+
+### 11.2 容量估算 (DAU 50 万, 日活对话 150 万轮)
+
+| 项 | 估算 |
+| --- | --- |
+| 触发评估 QPS | 峰值 ≈ 300 (每轮回答后 1 次) |
+| 实际生成量 | 按 20% 触发率 ≈ 30 万次/日 |
+| LLM 调用 | 生成 30 万 + 验算 30 万 = 60 万次/日 (快速模型) |
+| MySQL | practice 表 30 万行/日, 热数据 3 个月 ≈ 2700 万行, 按 student_id 月分区 |
+| Redis | 冷却+计数键 ≈ 50MB |
+| Outbox | 4 事件 × 30 万 ≈ 120 万行/日, T+7 归档 |
+
+---
+
+## 12. 合规红线 (C1-C10)
+
+| 编号 | 红线 |
+| --- | --- |
+| C1 | 嵌入式练习为辅助检测, **不得作为任何考试/排名/奖惩依据**, 产品文案不得出现"测验/考试"字样 |
+| C2 | 学生端不展示理解度数值与能力标签 (守卫 G8), 防标签化与焦虑 |
+| C3 | 练习可跳过且跳过零惩罚, 跳过入口不得隐藏或诱导关闭 |
+| C4 | 题目内容过内容安全校验 (D3 fail-closed), 适龄语言校验每季度复核 |
+| C5 | 嵌入式练习错误**不自动进入错题本**, 不推送给家长作为负面通报素材 |
+| C6 | 账号注销后本域数据 (practice/comprehension/outbox) 随注销流程删除, 最长延迟 180 天 |
+| C7 | 对话内容用于信号分析仅限本域, 不出域, 不脱敏前不入数仓 |
+| C8 | 单对话练习频次硬上限 (≤5) 为未成年人保护约束, 不可配置突破 |
+| C9 | AI 危机信号 (自伤/欺凌等) 权威归安全审计链路, 本引擎检测到时仅透传, 不自行处置 (契约 R11) |
+| C10 | 生成内容遵守 AIGC 标识规范, 题目与解析在服务端留痕可溯源 |
+
+---
+
+## 13. 契约对齐 (R1-R12)
+
+| 编号 | 契约 |
+| --- | --- |
+| R1 | Prompt 拼装权威归 AI 编排系统, 本引擎仅提供生成用的子 Prompt, 不拼接最终对话 Prompt |
+| R2 | 客观题结构化判题复用统一判题引擎的匹配组件; 主观题语义判定在本域内完成 (微练习轻量场景, 不走完整判题会话) |
+| R3 | 掌握度画像单写者=知识追踪引擎, 本引擎经 `idep.practice.answered` 事件供证据, 证据权重由知识追踪引擎裁决 |
+| R4 | 情感信号只读订阅情感感知引擎输出, 本引擎不做情感分析 (避免双写者) |
+| R5 | 防沉迷/使用时长约束权威归防沉迷体系, 本引擎触发频次不与之冲突且受其钳制 |
+| R6 | 错题收录权威归错题服务, 本域练习错误不自动收录 (合规 C5) |
+| R7 | 内容安全校验权威归教育场景内容安全引擎, 本域仅调用不做自有词库 |
+| R8 | 家长侧可见性: 嵌入式练习结果仅聚合进学情报告, 不逐题推送家长 |
+| R9 | 埋点经统一埋点平台, 本域埋点事件命名 `idep_*` |
+| R10 | 复习调度权威归间隔重复复习调度引擎, FLAG_FOR_REVIEW 仅发事件 |
+| R11 | 危机信号权威归 AI 对话安全审计与危机干预链路, 本域仅透传 |
+| R12 | 知识点上下文 (当前讲解 KP) 由对话编排引擎注入, 本域不自行从对话推断 KP (避免与知识点标注系统双写者) |
+
+---
+
+## 14. 验收场景 (AC01-AC16)
+
+| 编号 | 场景 | 预期 |
+| --- | --- | --- |
+| AC01 | 讲解后触发分数达标 | 2s 内卡片插入对话流, 题型与 KP 类型匹配 |
+| AC02 | 冷却期内重复触发 | 不触发, 返回 IN_COOLDOWN |
+| AC03 | 单对话第 6 次触发尝试 | 拒绝, 硬约束 G4 |
+| AC04 | 学生说"懂了" | CLAIM_UNDERSTOOD 触发, 难度 +0.1 |
+| AC05 | 学生跳过练习 | 记录 SKIPPED, 不产理解度, 画像无变化 (G2) |
+| AC06 | 作答超时 90s | TIMEOUT→CLOSED, 不产理解度 (G2) |
+| AC07 | 重复提交作答 | 首个生效, 其余幂等返回原结果 (51805) |
+| AC08 | 生成内容安全校验拒绝 | 丢弃, 不下发, 不计配额 (G5/D3) |
+| AC09 | LLM 生成超时 2.5s | ABANDONED, 对话继续无感知 (G1) |
+| AC10 | 验算模型宕机 | 单模型结果降权使用, confidence≤0.5 (51803) |
+| AC11 | 答错且同 KP 当日第 2 次 | FLAG_FOR_REVIEW, kp.review.flagged 事件发出 |
+| AC12 | 理解度 0.85 连续 2 次正确 | 推荐 GENERATE_HARDER_QUESTION |
+| AC13 | 低置信评估 (conf<0.6) | 不产生策略变更 (G10) |
+| AC14 | 学生情绪沮丧 | 不触发练习 (G9) |
+| AC15 | 会话归档时存在 PENDING | 批量 EXPIRED, 补交被拒 (51806) |
+| AC16 | 账号注销 | 本域数据随注销删除 (C6) |
+
+---
+
+## 15. 关联文档与维护记录
+
+### 15.1 关联文档
+
+- 《AI辅导对话教育成效评估与学习增值量化引擎》— 事后成效评估 (本引擎为事中检测)
+- 《服务端-AI辅导对话知识点掌握度实时更新与能力维度同步引擎》— 掌握度写回契约 (R3)
+- 《服务端-AI辅导对话情感感知与自适应回应策略引擎》— 情感信号订阅源 (R4)
+- 《AI输入安全与教育对话护栏引擎》/《教育场景敏感词多层次过滤与内容安全规则引擎》— 内容安全校验 (R7)
+- 《间隔重复算法与遗忘曲线复习调度引擎》— FLAG_FOR_REVIEW 消费方 (R10)
+- 《多题型统一判题引擎与答案评估策略框架》— 客观题判题组件复用 (R2)
+
+### 15.2 维护记录
+
+- **v1.0 (2026-08-06)**: 初版。完成概述/架构/数据结构 (§1-§3)、触发决策与题目生成 (§4.1-§4.2)、作答评估管线 (§4.2.2 尾部)、理解度评估开头 (§4.3.1 前半)。
+- **v1.1 (2026-10-20)**: 补全烂尾文档。原文件 702 行截断于 §4.3.1 `ComprehensionCalculator.calculate` 文档字符串中段 (围栏未闭合), §4.3.1 后半及全部后续章节缺失。本次补齐:
+  - 补齐 §4.3.1: 贝叶斯更新完整实现 (Beta 共轭先验/练习证据权重/对话信号融合/证据矛盾回缩/置信度计算), 围栏闭合;
+  - 新增 §4.3.2: 8 类对话行为信号定义表 + 提取红线 (情感信号只读 R4);
+  - 新增 §4.4: 策略推荐器 (决策表 + 完整实现 + 连续低分计数口径 + 不自动进错题本裁决 R6);
+  - 新增 §5: 核心流程 (mermaid 主链路时序/延迟预算表含端到端 ≤2s P95/idep_outbox DDL 增补 + 5 类 Redis 键);
+  - 新增 §6: 练习记录六态状态机 + 对话级触发六态状态机 + 守卫 G1-G10 (G1 主链路永不阻塞/G2 跳过非负面证据/G3 掌握度单写者/G8 不展示数值标签);
+  - 新增 §7: 幂等并发八场景 (作答重复提交/生成锁/放弃与回调竞态/归档与补交);
+  - 新增 §8: idep.domain.events 五事件消费方矩阵 + 三上游订阅 + 消费契约 (证据权重 0.6 弱于正式测评);
+  - 新增 §9: 错误码 51800-51899 共 13 项 (段位全库扫描确认空闲, 内部码不透传客户端);
+  - 新增 §10: 降级 D1-D10 (D3 内容安全 fail-closed/D10 总红线);
+  - 新增 §11: 监控 M1-M10 + DAU50 万容量估算;
+  - 新增 §12: 合规 C1-C10 (不考试不排名/跳过零惩罚/不自动进错题本/注销即删);
+  - 新增 §13: 契约 R1-R12 (Prompt 拼装归编排/判题复用统一引擎/掌握度单写者/情感只读/KP 由编排注入不自行推断);
+  - 新增 §14: 验收场景 AC01-AC16;
+  - 新增 §15: 关联文档与维护记录。
+  - 核验: 全文围栏 BALANCED, UTF-8 无 BOM, 零 TODO 占位。
