@@ -2,17 +2,7 @@
 
 == 2026-10-26 批次(四):队首 客户端动态化运营活动页面与JSON驱动渲染引擎-详细设计.md 已修复入库(770→1430 行,围栏 36/36 BALANCED+UTF-8 无 BOM,零 TODO,错误码 06600-06699 共 9 项全库扫描确认空闲,修复 v1.0 缺陷 F1 buildPage 签名多余右括号),出队;README 索引补登记(此前零登记);新队首:服务端数据库读写分离与分库分表演进策略 787@L733 ==
 
-==== 服务端数据库读写分离与分库分表演进策略-详细设计.md | 787 lines | unclosed: ```@L733 ====
-        """执行 Saga"""
-        logger.info(f"Saga [{self.name}] 开始执行, 共 {len(self.steps)} 步")
-
-        for step in self.steps:
-            step.status = SagaStepStatus.EXECUTING
-            try:
-                await step.execute()
-                step.status = SagaStepStatus.COMPLETED
-                self.completed_steps.append(step)
-                logger.info(f"Saga [{self.name}] 步
+== 2026-10-26 批次(五):队首 服务端数据库读写分离与分库分表演进策略-详细设计.md 已修复入库(787→1391 行,围栏 46/46 BALANCED+UTF-8 无 BOM,零 TODO,错误码 51100-51113 共 14 项 511xx 段位全库扫描确认空闲,修复 v1.0 缺陷 F1 require_write 空实现/F2 会话工厂导入缺失),出队;README 索引补登记(此前零登记);新队首:客户端-知识图谱浏览与关联学习页面架构与交互设计 795@L710 ==
 
 ==== 客户端-知识图谱浏览与关联学习页面架构与交互设计-详细设计.md | 795 lines | unclosed: ```@L710 ====
       case MasteryLevel.unknown:  return const Color(0xFFB0BEC5);
