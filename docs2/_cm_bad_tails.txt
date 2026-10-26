@@ -1,27 +1,3 @@
-==== 服务端-教育内容学习目标自动提取与课标核心素养对齐引擎-详细设计.md | 836 lines | unclosed: ```@L835 ====
-    "inferenceBasis": "推断依据说明",
-    "confidenceScore": 0.0-1.0
-  }
-]
-```
-
-#### 4.2.3 素养维度对齐Prompt模板
-
-```text
-你是一名课程标
-
-==== 服务端-学生AI学习伙伴角色个性化与对话风格自适应引擎-详细设计.md | 838 lines | unclosed: ```@L729 ====
-        }
-        if ("analytical".equals(style) && traits.personality.directness > 0.7) {
-            score += 0.15;
-        }
-        if ("social".equals(style) && traits.personality.warmth > 0.7) {
-            score += 0.15;
-        }
-        
-        // 性格标签匹配
-        if (personalityTags.contains("enc
-
 ==== 端到端流程设计-数据导出与账户注销完整链路-详细设计.md | 840 lines | unclosed: ```@L774 ====
  │  点击下载               │                        │                     │                   │                │
  │───────────────────────▶│  GET /download          │                     │                   │               …
