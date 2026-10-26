@@ -808,3 +808,594 @@ class ShortCodeGenerator:
         # MurmurHash 风格的位混合
         value ^= value >> 16
         value = (value * ShortCodeGenerator.OBFUSCATION_SALT) & 0xFFFFFFFF
+        value ^= value >> 13
+        return value
+```
+
+### 6.3 短码唯一性保障
+
+短码用于分享链接、邀请码等绝对不可重复的场景，采用 **三层防护** 设计：
+
+| 层级 | 机制 | 语义 | 兜底 |
+|------|------|------|------|
+| L1 | Snowflake 截断 + 混淆 | 单调发号窗口内（62^6≈568 亿个）理论无碰撞 | L2 |
+| L2 | Redis Bloom Filter 预检 | `BF.EXISTS=0` 可直接使用；`=1`（含 ~1% 误判）转 L3 | L3 |
+| L3 | 业务表唯一索引 + 占码登记 | `INSERT` 冲突即重生成，最终裁决 | 重试上限后抛错 |
+
+**占码守卫**（由分享服务等在生成短链时调用，`db_insert_fn` 为业务表插入，如 `INSERT INTO short_link(code, ...)`）：
+
+```python
+# primetop/common/idgen/short_code.py（续）
+
+class ShortCodeUniquenessGuard:
+    """
+    短码占码守卫：Bloom 预检 + DB 唯一索引裁决
+
+    使用约定:
+    - db_check_fn(code) -> bool: 业务表是否已存在该短码
+    - db_insert_fn(code): 业务表原子占码 INSERT（uk 冲突抛 DuplicateKeyError）
+    - claim 成功返回 True 表示短码已归本调用方所有，必须随后完成业务落库
+    """
+
+    BLOOM_KEY = "idgen:bloom:short_code"
+
+    def __init__(self, redis_client, db_check_fn, db_insert_fn):
+        self._redis = redis_client
+        self._db_check_fn = db_check_fn
+        self._db_insert_fn = db_insert_fn
+
+    async def claim(self, code: str) -> bool:
+        # L2: Bloom 预检（Bloom 故障时直查 DB，见降级 D5）
+        try:
+            exists = await self._redis.execute_command(
+                "BF.EXISTS", self.BLOOM_KEY, code)
+        except Exception:
+            exists = 1  # Bloom 不可用保守降级为"可能存在"
+        if exists and await self._db_check_fn(code):
+            return False
+
+        # L3: DB 原子占码
+        try:
+            await self._db_insert_fn(code)
+        except DuplicateKeyError:
+            await self._redis.execute_command("BF.ADD", self.BLOOM_KEY, code)
+            return False
+
+        # 登记 Bloom，加速后续重复拦截
+        try:
+            await self._redis.execute_command("BF.ADD", self.BLOOM_KEY, code)
+        except Exception:
+            pass  # Bloom 登记失败不影响已占码结果
+        return True
+```
+
+**守卫规则：**
+- G6：短码必须经 `claim()` 占码成功方可下发给客户端；直接 `generate()` 不查重的短码仅限无唯一性要求的展示场景（如临时会话标识）。
+- G9：Bloom Filter 初始化容量 1 亿、误判率 0.1%（`BF.RESERVE`），写满后按周重建并全量回灌 DB 已用短码，防止误判率劣化拖慢 L3。
+
+### 6.4 短码容量与碰撞概率
+
+**Snowflake 截断分支**（主路径）：连续发号在取模回绕前（62^6=568 亿个）值域不重复，冲突仅发生于多 Worker 同毫秒截断同值的极小概率事件，由 `claim()` 兜底重试，无容量风险。
+
+**随机重试分支**（`generate_with_check` 中 `os.urandom` 兜底）适用生日悖论估算 `p ≈ 1 - exp(-n²/2N)`：
+
+| 长度 | 空间 N | 单日生成 1 万 | 单日生成 5 万 | 单日生成 10 万 |
+|------|--------|--------------|--------------|----------------|
+| 6 位 | 5.68×10¹⁰ | p≈0.09% | p≈2.2% | p≈8.8% |
+| 8 位 | 2.18×10¹⁴ | p≈2.3×10⁻⁷ | p≈5.7×10⁻⁶ | p≈2.3×10⁻⁵ |
+
+结论：**随机分支单日生成须 ≤1 万（6 位）**，超过时运营侧应改发 8 位短码； Snowflake 分支不设日限额，受全局发号速率约束（单 Worker 204.8 万/秒）。
+
+---
+
+## 7. 引擎主入口（engine.py）
+
+### 7.1 统一门面
+
+```python
+# primetop/common/idgen/engine.py
+
+import os
+from dataclasses import dataclass
+
+from primetop.common.idgen.snowflake import SnowflakeGenerator
+from primetop.common.idgen.business_code import (
+    BusinessCodeGenerator, BusinessPrefix)
+from primetop.common.idgen.short_code import (
+    ShortCodeGenerator, ShortCodeUniquenessGuard)
+
+PRIMETOP_EPOCH_MS = 1735689600000  # 2025-01-01T00:00:00Z，全局唯一，上线后禁止变更
+
+
+@dataclass(frozen=True)
+class ParsedId:
+    """ID 解析结果（仅供内部排障，禁止对外暴露）"""
+    timestamp_ms: int
+    datacenter_id: int
+    worker_id: int
+    sequence: int
+
+
+class IdGenEngine:
+    """
+    全局 ID 生成门面（进程内单例）
+
+    初始化时机: FastAPI lifespan（见 §4.3），初始化完成前调用任何
+    next_* 方法抛 RuntimeError（fail-closed，禁止半成品发号）。
+    """
+
+    _primary: SnowflakeGenerator | None = None
+    _biz: BusinessCodeGenerator | None = None
+    _short: ShortCodeGenerator | None = None
+
+    @classmethod
+    def init(cls, *, redis_client, datacenter_id: int | None = None,
+             service_name: str | None = None,
+             epoch_ms: int = PRIMETOP_EPOCH_MS) -> None:
+        import primetop.common.idgen.worker_manager as wm
+
+        dc = datacenter_id if datacenter_id is not None else int(
+            os.environ.get('DATACENTER_ID', '0'))
+        svc = service_name or os.environ.get('SERVICE_NAME', 'unknown')
+
+        manager = wm.WorkerManager(dc, svc)
+        # register() 内部处理复用/分配；worker_id 被夺占时抛
+        # WorkerIdStolenError，生成器保持未初始化态（fail-closed）
+        worker_id = cls._run_sync(manager.register())
+
+        cls._primary = SnowflakeGenerator(dc, worker_id, epoch_ms)
+        cls._biz = BusinessCodeGenerator(redis_client)
+        cls._short = ShortCodeGenerator(cls._primary)
+
+    # ---- 主键 ID ----
+    @classmethod
+    def next_id(cls) -> int:
+        return cls._require_primary().generate()
+
+    @classmethod
+    def next_ids(cls, count: int) -> list[int]:
+        return cls._require_primary().generate_batch(count)
+
+    # ---- 业务序号 ----
+    @classmethod
+    def next_code(cls, prefix: BusinessPrefix) -> str:
+        return cls._require_biz().generate(prefix)
+
+    @classmethod
+    def next_codes(cls, prefix: BusinessPrefix, count: int) -> list[str]:
+        return cls._require_biz().generate_batch(prefix, count)
+
+    # ---- 短码 ----
+    @classmethod
+    def next_short_code(cls, length: int = 6) -> str:
+        """仅用于无唯一性要求的场景；唯一性场景用 next_claimed_short_code"""
+        return cls._require_short().generate(length)
+
+    @classmethod
+    async def next_claimed_short_code(cls, guard: ShortCodeUniquenessGuard,
+                                      length: int = 6) -> str:
+        """带占码守卫的短码生成（分享/邀请等唯一性场景唯一入口）"""
+        return await cls._require_short().generate_with_check(
+            length, guard.claim)
+
+    # ---- 解析（内部排障专用）----
+    @classmethod
+    def parse(cls, id_: int) -> ParsedId:
+        g = cls._require_primary()
+        return ParsedId(
+            timestamp_ms=g.extract_timestamp(id_, PRIMETOP_EPOCH_MS),
+            datacenter_id=g.extract_datacenter_id(id_),
+            worker_id=g.extract_worker_id(id_),
+            sequence=g.extract_sequence(id_),
+        )
+
+    @classmethod
+    def _require_primary(cls) -> SnowflakeGenerator:
+        if cls._primary is None:
+            raise RuntimeError(
+                "IdGenEngine 未初始化（worker_id 未分配或已被夺占）")
+        return cls._primary
+
+    @classmethod
+    def _require_biz(cls) -> BusinessCodeGenerator:
+        if cls._biz is None:
+            raise RuntimeError("IdGenEngine 未初始化")
+        return cls._biz
+
+    @classmethod
+    def _require_short(cls) -> ShortCodeGenerator:
+        if cls._short is None:
+            raise RuntimeError("IdGenEngine 未初始化")
+        return cls._short
+```
+
+### 7.2 业务侧调用示例
+
+```python
+# 订单服务：主键 + 订单号一次生成
+async def create_order(user_id: int, amount: int) -> Order:
+    order_id = IdGenEngine.next_id()                    # BIGINT 主键
+    order_no = IdGenEngine.next_code(BusinessPrefix.ORDER)  # ORD2026052614370001
+    order = Order(id=order_id, order_no=order_no, user_id=user_id, amount=amount)
+    ...
+
+# 分享服务：带占码守卫的短码（唯一性场景）
+async def create_share_link(user_id: int, target_type: str, target_id: int) -> str:
+    guard = ShortCodeUniquenessGuard(redis, db.check_short_code, db.insert_short_code)
+    code = await IdGenEngine.next_claimed_short_code(guard, length=6)
+    await db.bind_short_link(code, user_id, target_type, target_id)
+    return f"https://pt.top/s/{code}"
+```
+
+---
+
+## 8. 配置项
+
+| 配置 | 环境变量 / 常量 | 默认值 | 说明 |
+|------|----------------|--------|------|
+| 自定义纪元 | `PRIMETOP_EPOCH_MS`（代码常量） | 1735689600000 | **上线后禁止变更**（R4） |
+| 数据中心 ID | `DATACENTER_ID` | 0 | 0~3，由部署平台注入，禁止硬编码 |
+| 服务名 | `SERVICE_NAME` | unknown | Worker 注册用 |
+| 时钟回拨容忍 | `IDGEN_CLOCK_TOLERANCE_MS` | 5 | 超阈值 fail-closed |
+| 心跳间隔 | `IDGEN_HEARTBEAT_INTERVAL_SEC` | 10 | |
+| 过期阈值 | `IDGEN_WORKER_EXPIRE_SEC` | 30 | 无心跳标记 EXPIRED |
+| 死亡阈值 | `IDGEN_WORKER_DEAD_SEC` | 300 | EXPIRED 超时标记 DEAD 并释放 slot |
+| Redis 连接 | `IDGEN_REDIS_URL` | — | 业务序号/Bloom 共用，与业务 Redis 逻辑隔离（独立 db 索引） |
+
+---
+
+## 9. 核心流程
+
+### 9.1 服务启动 WorkerID 注册时序
+
+```mermaid
+sequenceDiagram
+    participant S as 业务服务实例
+    participant M as WorkerManager
+    participant DB as MySQL(idgen_worker_registry)
+
+    S->>M: register()
+    M->>DB: 查已有注册(instance_id, ACTIVE)
+    alt 已有注册（重启复用）
+        DB-->>M: worker_id
+        M->>DB: 续约 heartbeat（CAS 校验身份）
+    else 无注册
+        M->>DB: 清理 EXPIRED/DEAD
+        M->>DB: 选最小空闲 slot → INSERT
+        alt 唯一冲突（并发注册）
+            DB-->>M: DuplicateKeyError
+            M->>M: 重试（≤3 次，退避 50/100/200ms）
+        end
+    end
+    M-->>S: worker_id
+    S->>S: 初始化 SnowflakeGenerator
+    loop 每 10s
+        M->>DB: 续约心跳
+        alt 续约失败（worker_id 被夺占）
+            M-->>S: WorkerIdStolenError
+            S->>S: 暂停发号 + 重新注册（新 worker_id）
+        end
+    end
+```
+
+### 9.2 业务序号生成时序
+
+```mermaid
+sequenceDiagram
+    participant B as 业务服务
+    participant R as Redis
+    participant DB as MySQL(业务表)
+
+    B->>R: INCR idgen:seq:ORD:2026052614
+    R-->>B: seq=42
+    alt seq=1（新建 key）
+        B->>R: EXPIRE key 48h
+    end
+    alt seq > 9999
+        B-->>B: 抛 SequenceOverflowError(50007)
+    else
+        B->>DB: INSERT 业务单(含序号)
+    end
+```
+
+**延迟预算**：`next_id()` 本地生成 P99 ≤ 1μs；`next_code()` Redis RTT P99 ≤ 5ms；`next_claimed_short_code()` Bloom 命中 P99 ≤ 3ms、Bloom 未命中（查 DB）P99 ≤ 15ms。
+
+---
+
+## 10. 状态机与守卫
+
+### 10.1 WorkerRegistry 状态机
+
+```text
+                 ┌──────────┐  心跳丢失>30s   ┌──────────┐  持续无心跳>300s  ┌────────┐
+   注册(最小空slot)▶│ ACTIVE   │──────────────▶│ EXPIRED  │────────────────▶│  DEAD  │
+                 └────┬─────┘               └────┬─────┘                 └───┬────┘
+                      │ 优雅关闭(deregister)      │ 本实例心跳恢复续约          │ slot 可被
+                      │ (标记DEAD,立即释放)       │ (CAS 校验 instance_id)     │ 重新分配
+                      ▼                          ▼ (失败→worker_id被夺占)        ▼
+                 ┌──────────┐               重新 register() 申请新 slot      新实例注册
+                 │  DEAD    │
+                 └──────────┘
+```
+
+| 转移 | 触发 | 动作 |
+|------|------|------|
+| （无）→ ACTIVE | 注册（最小空 slot INSERT 成功） | 开始发号 |
+| ACTIVE → EXPIRED | 心跳丢失 > 30s（清理任务标记） | 保留 slot 300s 可恢复 |
+| EXPIRED → ACTIVE | 本实例心跳恢复且 slot 未被夺占 | CAS 续约成功，继续发号 |
+| EXPIRED → DEAD | 持续无心跳 > 300s | 释放 slot，可被重新分配 |
+| ACTIVE → DEAD | 优雅关闭 / 死亡回收 | 释放 slot |
+
+### 10.2 守卫总表
+
+| 编号 | 规则 | 级别 |
+|------|------|------|
+| G1 | 同一 (datacenter_id, worker_id) 任一时刻只有一个 ACTIVE 持有者（DB 主键 + 续约 CAS 双保险） | 强约束 |
+| G2 | worker_id 被夺占后旧实例立即暂停发号，重新注册成功前 `next_*` 抛 50014（fail-closed） | 强约束 |
+| G3 | 时钟回拨 > 5ms 抛 `ClockMovedBackwardError`(50001)，禁止发号 | 强约束 |
+| G4 | 毫秒内序列耗尽必须等待下一毫秒，禁止复用/回绕序列 | 强约束 |
+| G5 | Redis 宕机时业务序号 fail-closed（50006），禁止本地计数替代（防重号） | 强约束 |
+| G6 | 短码唯一性场景必须经 `claim()` 占码 | 强约束 |
+| G7 | DEAD slot 回收后方可重新分配；EXPIRED slot 分配前必须二次确认持有者已死亡 | 强约束 |
+| G8 | 纪元使用时间超过 2^41ms（约 69 年）前 1 年必须启动方案迁移，溢出时 fail-closed | 强约束 |
+| G9 | 业务序号每小时 9999 硬顶，溢出拒绝（50007），禁止顺延侵占下一时段 | 强约束 |
+| G10 | `register()` 幂等：同 instance_id 重复调用复用已有注册，不重复占 slot | 强约束 |
+
+---
+
+## 11. 幂等与并发场景
+
+| 场景 | 并发问题 | 裁决 |
+|------|----------|------|
+| 两实例同时注册选中最小空 slot | 读-选-插入非原子 | DB 主键 (dc, worker_id) 冲突，败方捕获 DuplicateKeyError 重试（≤3 次退避），F2 补丁 |
+| 实例重启再次 register | 重复占 slot | 先查 instance_id 已有 ACTIVE 注册，复用（G10） |
+| 网络分区 30s+ 后恢复，原 slot 已被新实例持有 | 双实例同 worker_id 发号（致命） | 续约 CAS `WHERE worker_id=? AND instance_id=?`，失败即判定夺占，旧实例停号重注册（F1 补丁，G1/G2） |
+| 心跳并发更新 | 互相覆盖 | 幂等（同值覆盖无影响）+ CAS 身份校验 |
+| INCR / INCRBY | 并发自增 | Redis 单线程原子，天然安全 |
+| 批量序号超限回滚 | 回滚期间另一请求 INCR | 回滚用 INCRBY(-count) 原子完成；中间窗口新号段与本批交错无重复（值域唯一） |
+| 短码 claim 与业务落库之间服务崩溃 | 短码已占未绑定 | 占码即写业务表（同事务或先占后绑由调用方保证）；孤儿短码由业务侧过期回收后补登 Bloom |
+| 批量生成部分失败 | 一半成功一半异常 | 主键批量纯内存无失败面；业务序号批量 Redis 返回即成功，DB 写失败由业务事务回滚（序号跳号可接受，见 R2） |
+
+---
+
+## 12. 错误码（50000-50099）
+
+本组件为进程内库，无 REST 出口；错误码仅用于日志、告警与指标标签，**不透传客户端**。段位 500xx 经全库扫描确认空闲。
+
+| 错误码 | 标识 | 含义 | 处置 |
+|--------|------|------|------|
+| 50001 | CLOCK_MOVED_BACKWARD | 时钟回拨超容忍阈值 | fail-closed，监控 M3 告警 |
+| 50002 | SEQUENCE_OVERFLOW_WAIT | 毫秒内序列耗尽等待（非错误） | 仅计数观测 |
+| 50003 | WORKER_ID_EXHAUSTED | WorkerID 耗尽（>1024 实例/DC） | 扩容数据中心或实例合并 |
+| 50004 | WORKER_REGISTER_CONFLICT | 注册唯一冲突 | 自动重试 ≤3 次 |
+| 50005 | WORKER_HEARTBEAT_FAILED | 心跳写库失败 | 指数退避重试，连续 3 次告警 |
+| 50006 | REDIS_SEQ_UNAVAILABLE | Redis 序号池不可用 | fail-closed（G5） |
+| 50007 | BIZ_SEQ_HOURLY_EXHAUSTED | 业务序号时段耗尽 | 拒绝 + 容量告警 |
+| 50008 | SHORT_CODE_CONFLICT | 短码冲突重试（命中守卫） | 自动重试，连续计数 |
+| 50009 | SHORT_CODE_RETRY_EXHAUSTED | 短码重试耗尽 | 抛错，人工介入 |
+| 50010 | EPOCH_OVERFLOW | 纪元溢出（理论） | fail-closed（G8） |
+| 50011 | BATCH_SIZE_INVALID | 批量参数非法 | 参数校验拒绝 |
+| 50012 | INVALID_PREFIX | 未注册业务前缀 | 注册表新增需评审（R5） |
+| 50013 | BLOOM_UNAVAILABLE | Bloom 故障降级直查 DB | 自动降级（D5） |
+| 50014 | WORKER_ID_NOT_ASSIGNED / STOLEN | 未注册或已被夺占 | fail-closed（G2） |
+
+---
+
+## 13. 降级矩阵
+
+| 编号 | 故障场景 | 降级策略 | 恢复 |
+|------|----------|----------|------|
+| D1 | Worker 注册表短暂不可用 | 已持有 worker_id 的实例照常发号；新实例启动阻塞重试（≤60s 后失败退出，K8s 重启） | 表恢复后正常注册 |
+| D2 | Redis 宕机（业务序号/Bloom） | 业务序号 fail-closed（G5）；主键 Snowflake 本地发号不受影响；短码唯一性场景转 DB 直查（D5） | Redis 恢复 |
+| D3 | 时钟回拨 ≤5ms | 自动等待追回，无感 | NTP 校正 |
+| D4 | 时钟回拨 >5ms | fail-closed 抛 50001，禁止发号 | NTP 强制同步后恢复 |
+| D5 | Bloom Filter 不可用 | 每次 claim 直查 DB（P99 15ms），吞吐量降至 DB 上限 | Bloom 恢复 |
+| D6 | 短码 DB 占码冲突率升高（>1%） | 自动切换 8 位短码（空间扩大 3844 倍） | 冲突率回落后配置回切 |
+| D7 | 心跳写库连续失败 | 本地继续发号（worker_id 未过期窗口 30s 内）；连续失败 >3 次主动停号重注册 | 写库恢复 |
+| D8 | metrics 上报失败 | 静默丢弃，绝不阻塞发号主链路 | 上报恢复 |
+| D9 | 单 Worker 序列耗尽（>204.8 万/s） | 等待下一毫秒（50002 计数），无感 | 实例扩容分摊 |
+| D10 | 总红线 | **唯一性不可降级**：任何降级路径不得跳过唯一性检查或放宽 G1-G10 守卫 | — |
+
+---
+
+## 14. 监控指标与容量
+
+### 14.1 指标定义（metrics.py，对应 §2.2 模块分层）
+
+```python
+# primetop/common/idgen/metrics.py
+
+from prometheus_client import Counter, Histogram, Gauge
+
+# 发号
+idgen_generate_total = Counter(
+    'idgen_generate_total', 'ID 生成次数', ['kind'])  # kind: primary|biz|short
+idgen_generate_latency = Histogram(
+    'idgen_generate_latency_seconds', '生成延迟', ['kind'])
+
+# 异常
+idgen_clock_rollback_total = Counter(
+    'idgen_clock_rollback_total', '时钟回拨次数', ['within_tolerance'])
+idgen_errors_total = Counter(
+    'idgen_errors_total', '错误次数', ['code'])  # 50001~50014
+
+# 业务序号
+idgen_biz_seq_exhausted_total = Counter(
+    'idgen_biz_seq_exhausted_total', '时段序号耗尽次数', ['prefix'])
+
+# 短码
+idgen_short_code_conflict_total = Counter(
+    'idgen_short_code_conflict_total', '短码冲突重试次数', ['length'])
+
+# Worker 注册表
+idgen_workers_active = Gauge(
+    'idgen_workers_active', 'ACTIVE Worker 数', ['datacenter_id'])
+idgen_worker_stolen_total = Counter(
+    'idgen_worker_stolen_total', 'worker_id 被夺占次数')
+```
+
+### 14.2 告警阈值（M1-M10）
+
+| 编号 | 指标 | 阈值 | 级别 |
+|------|------|------|------|
+| M1 | idgen_errors_total{code="50001"} | >0 | P1（时钟异常） |
+| M2 | idgen_workers_active / DC | >900（90%） | P2 |
+| M3 | idgen_worker_stolen_total | 任意发生 | P2（观察网络分区） |
+| M4 | 50007 时段耗尽 | 任意发生 | P2（容量） |
+| M5 | 短码冲突率（50008/生成量） | >0.1%（6 位） | P3 |
+| M6 | 50009 重试耗尽 | 任意发生 | P1 |
+| M7 | next_code() P99 | >20ms（Redis RTT 基线 ×4） | P3 |
+| M8 | 心跳失败率 | 连续 3 次 | P2 |
+| M9 | 50014 未初始化调用 | 任意发生 | P1（服务启动缺陷） |
+| M10 | 时钟回拨等待时长 P99 | >4ms | P3（NTP 质量预警） |
+
+### 14.3 容量基线（DAU 50 万）
+
+| 项 | 估算 |
+|----|------|
+| 主键发号 | 日新增约 3000 万条记录（答题/行为/日志明细主键另计），峰值 2 万 QPS，单 Worker 余量 100× |
+| 业务序号 | 订单峰值 500/小时，上限 9999，余量 20× |
+| 短码 | 分享日活 5 万次 → Snowflake 分支无压力；随机分支红线 ≤1 万/日 |
+| 注册表 | 实例数 ≤200（K8s Pod），单 DC 上限 1024，余量 5× |
+| Bloom | 1 亿容量 × 0.1% 误判，Redis 内存约 120MB |
+
+---
+
+## 15. 合规要点
+
+| 编号 | 规则 |
+|------|------|
+| C1 | ID/序号/短码均不含 PII，禁止将手机号、姓名等编入任何标识 |
+| C2 | 短码经混淆不可枚举，禁止对外提供遍历接口（分享链接须配合鉴权/过期校验，权威归分享服务） |
+| C3 | `parse()` 解析能力仅供内部排障，禁止暴露管理端以外的任何接口 |
+| C4 | worker 注册与发号审计日志留存 180 天（instance_id/IP/时间），支撑安全溯源 |
+| C5 | 时钟源必须经 NTP 校准，容器环境禁用宿主机时钟漂移未监控的部署 |
+| C6 | 纪元与位布局变更视为 breaking change，需全员评审并保留新旧双读窗口（R4） |
+| C7 | 注销用户的历史 ID 不做回收复用（所有 ID 一次性使用） |
+| C8 | 随机短码分支禁用时间种子伪随机，必须使用 CSPRNG（`os.urandom`） |
+
+---
+
+## 16. 契约对齐（R1-R10）
+
+| 编号 | 裁决 |
+|------|------|
+| R1 | 主键 ID 形态（BIGINT 雪花改进版）为全平台唯一主键方案，禁止业务自造发号器；业务表主键统一 `BIGINT UNSIGNED` |
+| R2 | 订单号/报告号等人类可读序号**格式权威归本文**（`[前缀][YYYYMMDD][HH][4 位流水]`）；消费方（订单服务/学情报告/支付对账）只消费不自定义。序号允许跳号（事务回滚/批量失败），连续性不做承诺，对账以唯一性为准 |
+| R3 | 雪花 worker_id 发放表与《服务端数据库读写分离与分库分表演进策略》`id_worker_node`（分片环境租约形态）为同一语义演进：MVP 单库用本文 `idgen_worker_registry`，水平分表后切换 `id_worker_node` 租约，实现期二者保留一张（后者落地时删除前者），禁止双写并存 |
+| R4 | `PRIMETOP_EPOCH_MS` 与 64bit 位布局为全局常量，任何服务不得自定义纪元 |
+| R5 | `BusinessPrefix` 新增前缀需评审登记（防前缀碰撞与语义泛滥），管理端变更走配置中心双人审批 |
+| R6 | 短码存在性检查函数（`db_check_fn`/`db_insert_fn`）由调用方业务域提供，本组件不感知业务表结构；唯一索引必须建在业务表（兜底 L3） |
+| R7 | 报告编号 RPT 前缀与《学习报告生成与交付服务》对齐：编号在报告创建时一次性生成，重试复用原编号（幂等），禁止一报告多号 |
+| R8 | 指标命名 `idgen_*` 与监控平台规范对齐；各业务服务不得自行包装发号计数 |
+| R9 | 分享短链长度/字符集变更需与《统一短链服务与深链接跳转编排引擎》《分享与社交裂变系统》三方会签（外链已投放不可失效） |
+| R10 | 进程内门面 `IdGenEngine` 为唯一入口，禁止绕过门面直接实例化 `SnowflakeGenerator`（监控/守卫统一在门面生效） |
+
+---
+
+## 17. 验收场景
+
+| 编号 | 场景 | 预期 |
+|------|------|------|
+| AC01 | 单实例串行生成 100 万个 ID | 全部唯一，趋势递增，无异常 |
+| AC02 | 32 线程并发生成 1000 万个 ID | 全部唯一，P99 ≤ 1μs |
+| AC03 | 单 Worker 压测 204.8 万/秒边界 | 序列正确回绕等待，无重复无负数 |
+| AC04 | 时钟回拨 3ms | 自动等待追回，无重复 |
+| AC05 | 时钟回拨 10ms | 抛 50001，停号，恢复后正常 |
+| AC06 | 两实例并发注册 | 分配不同 worker_id，无死锁 |
+| AC07 | 实例重启 register | 复用原 worker_id（G10），不新增注册行 |
+| AC08 | 模拟网络分区 40s 后恢复，期间新实例占用其 slot | 旧实例续约 CAS 失败→停号→重注册新 worker_id，全程无重复 ID（F1 回归） |
+| AC09 | 单 DC 注册 1025 个实例 | 第 1025 个抛 50003 |
+| AC10 | Redis 宕机调用 next_code | 抛 50006（fail-closed），next_id 不受影响 |
+| AC11 | 单小时第 10000 个订单号 | 抛 50007，下一小时正常归零 |
+| AC12 | 批量生成 500 个 RPT 序号 | 连续 500 个，格式正确，Redis 仅 1 次 INCRBY |
+| AC13 | Bloom 命中误判场景 | 多查一次 DB 后正确占码，无错判 |
+| AC14 | 短码 DB 唯一冲突 | 自动重试生成新码，重试计数入 M5 |
+| AC15 | 随机分支单日 1 万短码占码 | 碰撞自动规避，无重复下发 |
+| AC16 | 优雅停机 | deregister 释放 slot，注册表状态 DEAD，新实例可立即复用 |
+
+---
+
+## 18. 关联文档
+
+| 文档 | 关系 |
+|------|------|
+| 服务端数据库读写分离与分库分表演进策略 | R3 worker_id 租约表演进；主键基因法依赖本文发号 |
+| 服务端分布式锁实现与并发资源竞争防护规范 | 同级基础设施，锁与发号并发防护互补 |
+| 支付与会员订阅-核心流程技术实现详细设计 | 订单号 ORD 前缀消费方（R2） |
+| 学习报告生成与交付服务 | 报告编号 RPT 前缀消费方（R7） |
+| 统一短链服务与深链接跳转编排引擎 / 分享与社交裂变系统 | 短码长度/字符集会签（R6/R9） |
+| 服务端统一数据对账与跨服务一致性校验引擎 | 序号跳号口径消费（R2 唯一性不承诺连续） |
+| 日志与监控告警体系 | idgen_* 指标接入与告警路由 |
+
+---
+
+## 19. v1.0 缺陷登记与修复补丁
+
+| 编号 | 缺陷 | 修复 |
+|------|------|------|
+| F1 | §4.2 `_renew_heartbeat` 无实例身份校验：网络分区 >30s 期间原 slot 被新实例分配，旧实例恢复后续约直接置 ACTIVE，导致**双实例同 worker_id 发号（ID 重复致命）** | §19.1 补丁：续约改 CAS（`WHERE worker_id=? AND instance_id=?`），影响行数为 0 即判定夺占抛 `WorkerIdStolenError`，门面 G2 停号重注册 |
+| F2 | §4.2 `_allocate_slot` 读-选-插入非原子，并发注册同 slot 时未处理 `DuplicateKeyError` | §19.1 补丁：捕获冲突退避重试 ≤3 次 |
+| F3 | §3.3 `generate_batch` 时钟回拨分支静默等待下一毫秒，绕过 `generate()` 的 5ms 容忍/抛错策略，策略不一致 | §19.1 补丁：批量路径统一调用回拨裁决方法（容忍等待 / 超限抛 50001） |
+| F4 | §2.2 模块分层列出 `metrics.py` 但正文缺失实现 | §14.1 补齐完整指标代码 |
+
+### 19.1 修复补丁代码
+
+```python
+# === F1/F2: worker_manager.py 补丁 ===
+
+class WorkerIdStolenError(RuntimeError):
+    """worker_id 被其他实例夺占（原实例网络分区后恢复）"""
+
+
+async def _renew_heartbeat(self):
+    # F1: CAS 续约——校验持有者身份，防双实例同 worker_id
+    result = await db.execute("""
+        UPDATE idgen_worker_registry
+        SET heartbeat_at = %s, status = 'ACTIVE'
+        WHERE datacenter_id = %s AND worker_id = %s AND instance_id = %s
+    """, (datetime.utcnow(), self._datacenter_id,
+           self._worker_id, self._instance_id))
+    if result == 0:
+        raise WorkerIdStolenError(
+            f"worker_id={self._worker_id} 已被其他实例持有，"
+            f"本实例停号并重新注册")
+
+
+async def _allocate_slot_with_retry(self) -> int:
+    # F2: 冲突退避重试（DB 主键兜底并发安全）
+    for attempt in range(3):
+        try:
+            return await self._allocate_and_insert()
+        except DuplicateKeyError:
+            await asyncio.sleep(0.05 * (2 ** attempt))
+    raise RuntimeError("WorkerID 分配重试 3 次仍冲突，实例启动失败")
+
+
+# === F3: snowflake.py generate_batch 回拨裁决统一 ===
+
+def _resolve_backward_clock(self, now: int) -> int:
+    """统一回拨裁决：容忍阈值内等待追回，超限抛错（G3）"""
+    if now >= self._last_timestamp:
+        return now
+    diff = self._last_timestamp - now
+    if diff <= self.CLOCK_BACKWARD_TOLERANCE_MS:
+        time.sleep(diff / 1000.0)
+        return self._current_millis()
+    raise ClockMovedBackwardError(
+        f"时钟回拨 {diff}ms，超出容忍阈值 "
+        f"{self.CLOCK_BACKWARD_TOLERANCE_MS}ms")
+
+# generate_batch 循环内首行改为:
+#     now = self._resolve_backward_clock(self._current_millis())
+# 替换原 `if now < self._last_timestamp: now = self._wait_next_millis(...)`
+```
+
+---
+
+## 20. 维护记录
+
+| 版本 | 日期 | 说明 |
+|------|------|------|
+| v1.0 | 2026-08 初批次 | 初始版本：概述/架构/Snowflake 改进算法/WorkerID 管理器/业务序号生成器/短码生成器。文件在 §6.2 `_obfuscate` 方法代码中段截断（围栏未闭合 @L691），§6.2 收尾及唯一性保障/引擎门面/配置/流程/状态机/幂等/错误码/降级/监控/合规/契约/验收全缺 |
+| v1.1 | 2026-10-26 | 补全烂尾文档：§6.2 收尾（`_obfuscate` 完成+闭合围栏）；新增 §6.3 短码唯一性三层防护（Bloom+DB uk）与占码守卫代码、§6.4 容量与碰撞概率（生日悖论两分支口径）、§7 引擎门面 engine.py 与业务调用示例、§8 配置项、§9 启动注册/业务序号 mermaid 时序×2+延迟预算、§10 WorkerRegistry 状态机+守卫 G1-G10、§11 幂等并发八场景、§12 错误码 50000-50014 共 14 项（500xx 段位全库扫描确认空闲，内部码不透传）、§13 降级 D1-D10（D10 总红线唯一性不可降级）、§14 监控 M1-M10+metrics.py 实现（修复 F4）+容量基线、§15 合规 C1-C8、§16 契约 R1-R10（关键裁决 R3 与分库分表文档 id_worker_node 演进关系/R2 序号跳号不承诺连续）、§17 验收 AC01-AC16、§18 关联文档、§19 v1.0 缺陷登记 F1-F4 与修复补丁（F1 双实例同 worker_id 致命竞态为最高优先修复） |
