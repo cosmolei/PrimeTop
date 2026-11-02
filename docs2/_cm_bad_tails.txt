@@ -1,15 +1,3 @@
-==== 服务端-教育平台统一风控决策中心与用户安全画像引擎-详细设计.md | 890 lines | unclosed: ```@L762 ====
-        }
-
-        return null; // 通过快速检查
-    }
-
-    /**
-     * 综合评分计算
-     */
-    private int calculateFinalScore(UserSecurityProfile profile,
-                                    
-
 ==== 服务端-题目答案正确性自动验算与解析一致性校验管线引擎-详细设计.md | 891 lines | unclosed: ```@L885 ====
 
 ### 6.2 批量验算控制器
