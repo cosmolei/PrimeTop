@@ -1,15 +1,3 @@
-==== 客户端手势交互与动画系统-详细设计.md | 855 lines | unclosed: ```@L843 ====
-  final Widget child;
-  final Color baseColor;
-  final Color highlightColor;
-  final Duration duration;
-
-  const ShimmerEffect({
-    super.key,
-    required this.child,
-    this.baseColor = const Color(0xFFE0E0E0),
-    this.highlightColor = const
-
 ==== 服务端-教育平台统一风控决策中心与用户安全画像引擎-详细设计.md | 890 lines | unclosed: ```@L762 ====
         }
 
