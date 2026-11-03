@@ -1,16 +1,4 @@
-﻿==== 客户端安全防护体系-详细设计.md | 936 lines | unclosed: ```@L829 ====
-    // ── 调试器检测 ──
-
-    private fun detectDebugger(): Boolean {
-        return Debug.isDebuggerConnected() || checkTracerPid()
-    }
-
-    /** 检查 /proc/self/status 中的 TracerPid */
-    private fun checkTracerPid(): Boolean {
-        return try {
-            val reader
-
-==== 生产事故应急响应与OnCall值班调度体系-详细设计.md | 936 lines | unclosed: ```@L935 ====
+﻿==== 生产事故应急响应与OnCall值班调度体系-详细设计.md | 936 lines | unclosed: ```@L935 ====
 | --- | --- | --- |
 | Alertmanager → 本服务 | 入 | Webhook + HMAC；label 约定 `severity/team/component/playbook_hint` |
 | 自愈引擎 → 本服务 | 入 | `POST /internal/webhooks/selfheal`，`need_human=true` 或 playbook 执行失败 |
