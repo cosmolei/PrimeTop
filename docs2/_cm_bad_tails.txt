@@ -1,16 +1,3 @@
-﻿==== 生产事故应急响应与OnCall值班调度体系-详细设计.md | 936 lines | unclosed: ```@L935 ====
-| --- | --- | --- |
-| Alertmanager → 本服务 | 入 | Webhook + HMAC；label 约定 `severity/team/component/playbook_hint` |
-| 自愈引擎 → 本服务 | 入 | `POST /internal/webhooks/selfheal`，`need_human=true` 或 playbook 执行失败 |
-| SLO 平台 → 本服务 | 入 | burn rate 超阈事件（fast/slow burn 两档分别映射 SEV2/SEV3） |
-| 本服务 → 通知中心 | 出 | SEV1/2 用户公告（系统公告/Banner），幂等键 `incident-{id}-update-{n}` |
-| 本服务 → 复盘引擎 | 出 | `RESOLVED` 后创建复盘任务；回写 `postmortem_id` |
-| 本服务 → 客服知识库 | 出 | 故障公告同步（坐席/AI 客服口径） |
-| 运维工作台 → 本服务 | UI | 排班/值班台/事故/状态页四个管理页面挂载 |
-```
-
-
-==== 服务端-教育视频内容学生观看行为智能分析与个性化观看体验优化引擎-详细设计.md | 942 lines | unclosed: ```@L660 ====
                 json.dumps(event.get('metadata', {}))
             ])
         self.clickhouse.execute(

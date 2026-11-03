@@ -511,6 +511,7 @@ CREATE TABLE incident_metrics_daily (
 | ONC-412-02 | SEV1 关闭未传 `confirm=true` |
 | ONC-404-01 | 事故编号不存在 |
 | ONC-403-01 | 非当值人员尝试认领（允许，但需带 `force=true` 并记录） |
+| ONC-409-03 | 交接记录重复提交（同班次唯一索引冲突） |
 
 ### 5.4 状态页与公告
 
@@ -932,4 +933,86 @@ GameDay 演练（配合混沌工程平台）：每月一次，从预案库随机
 | 本服务 → 复盘引擎 | 出 | `RESOLVED` 后创建复盘任务；回写 `postmortem_id` |
 | 本服务 → 客服知识库 | 出 | 故障公告同步（坐席/AI 客服口径） |
 | 运维工作台 → 本服务 | UI | 排班/值班台/事故/状态页四个管理页面挂载 |
+
+---
+
+## 16. 幂等性与并发控制
+
+### 16.1 幂等键与幂等机制总表
+
+| # | 场景 | 幂等机制 | 重复请求行为 |
+| --- | --- | --- | --- |
+| 1 | 告警 Webhook 接入 | `fingerprint`（sha256(source+groupKey+alertname+service)）+ Redis `SETNX oncall:fp:{fp}` 5min 窗口；Redis 故障降级查 `alert_event` 近 5min 同指纹 | 窗口内重复告警仅 `dedup_count+1` 并并入既有事故，不重复建单、不重复电话 |
+| 2 | 事故自动创建 | `alert_event.incident_id` 回填采用条件更新（`UPDATE ... WHERE incident_id IS NULL`），影响行数=0 说明已有事故 | 同指纹并发创建仅一个成功 |
+| 3 | 认领（ack） | `UPDATE incident SET status='ACKNOWLEDGED', ack_at=NOW(3), ack_by=? WHERE incident_no=? AND status='TRIGGERED'` 条件更新即幂等 | 重复 ack 返回 200 + 当前认领人（`alreadyAcked=true`），不产生第二条 ack_record |
+| 4 | 升级定时器执行 | Redis `ZREM` 先到先得 + DB 乐观锁 `WHERE id=? AND status=0` 双保险 | 双 worker 同任务仅一个执行成功 |
+| 5 | 状态机迁移（mitigate/resolve/close/merge/cancel） | 一律 `WHERE status=<期望值>` 条件更新 | 影响行数=0 → ONC-409-01（状态机拦截），绝不静默吞掉 |
+| 6 | 状态页公告发布 | 幂等键 `incident-{id}-update-{n}`（`status_page_update.idempotent_key` 唯一索引）+ `published_at IS NULL` CAS 发布 | 重复发布返回 200 幂等成功（同 published_at），不产生二次公告 |
+| 7 | 换班审批 | `UPDATE oncall_swap_request SET status=2 WHERE id=? AND status=1`（双方确认后才进入 1） | 双人重复审批仅一人生效，后者 ONC-409-01 语义 |
+| 8 | 排班批量生成 | `uk_team_date_shift (team_id, shift_date, shift_id)` upsert | 重复生成不产生重复行，返回本次新增/更新计数 |
+| 9 | 交接提交 | `uk_handover_schedule (schedule_id)` 唯一索引（见 16.3 增补） | 重复提交 ONC-409-03，首次记录为准 |
+
+### 16.2 并发竞态裁决
+
+| 竞态 | 裁决 |
+| --- | --- |
+| 双值班人同时点认领 | DB 行锁 + 条件更新，后到事务影响行数=0，读回 `ack_by` 返回当前认领人 + `alreadyAcked=true`（ONC-409-02） |
+| 同指纹告警并发触发自动建单 | `alert_event` 唯一键 `uk_fingerprint_window (fingerprint, window_start)` 兜底 + Redis SETNX 前置；并发仅一事务 INSERT 成功，失败者查回既有 `incident_id` 并入时间线 |
+| 事故自动创建与人工上报撞车 | 人工上报接口同样先查 5min 窗口同指纹/同服务同告警名记录，命中则并入既有事故而非新建；人工强制新建须带 `force=true` 并打 `source=manual_force` 标签 |
+| 升级定时器与人工 resolve 竞态 | 升级任务执行前重读事故状态，终态（RESOLVED/CLOSED/CANCELED）直接 ZREM + task 置 4 跳过；与状态机条件更新双保险 |
+| 状态页更新与事故状态回退（regress）竞态 | 公告发布以发布时刻的事故状态快照为准；regress 触发新一条 `status_page_update`，不允许覆盖已发布公告（历史公告不可变，只追加更正说明） |
+| 换班审批与排班生成器并发 | 审批通过的条件更新以 `shift_date` 归属排班版本号（`schedule_version`）为乐观锁；生成器重跑仅允许对 `version` 更高的新批次 upsert，不回改已审批通过的班次 |
+| 双人同时提交交接 | `uk_handover_schedule (schedule_id)` 唯一索引硬约束，第二人收到 ONC-409-03；支持后者以 `supersede=true` 追加补充记录（新行，关联同 schedule） |
+
+### 16.3 交接幂等增补（16.1 #9 引用的落库定义）
+
+```sql
+CREATE TABLE oncall_handover (
+  id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  schedule_id     BIGINT UNSIGNED NOT NULL            COMMENT '关联班次',
+  author_id       BIGINT UNSIGNED NOT NULL            COMMENT '交班人',
+  content         TEXT NOT NULL                       COMMENT '交接正文（Markdown）',
+  open_item_count INT UNSIGNED NOT NULL DEFAULT 0     COMMENT '遗留事项数',
+  attachment_json JSON NULL                           COMMENT '附件引用 [{"type":"doc","url":...}]',
+  created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  UNIQUE KEY uk_handover_schedule (schedule_id)       COMMENT '同班次仅一条正式交接记录，保证幂等'
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_general_ci;
 ```
+
+行为约定：
+
+1. 正常路径：首个提交者 `INSERT` 成功；重复提交捕获唯一索引冲突 → 返回 200 + 既有记录（`duplicated=true`），客户端提示"该班次已有交接记录"。
+2. 补充/更正：交班人需修订时走 `POST /oncall/handovers/{id}/supplements`（子表 `oncall_handover_supplement`，无唯一约束），正式记录保持首版不可变，满足审计追溯。
+3. 接班确认：接班人 `POST /oncall/handovers/{id}/confirm` 仅允许当值 schedule 的接班成员操作，条件更新 `WHERE confirmed_at IS NULL` 保证重复确认幂等。
+
+### 16.4 一致性守卫（G 系列）
+
+| 守卫 | 规则 | 违反后果 |
+| --- | --- | --- |
+| G1 | 一切状态迁移必须经过状态机条件更新（`WHERE status=<期望值>`） | 禁止先读后写的裸更新，代码评审红线 |
+| G2 | 所有 Webhook 入口必须先过指纹幂等再进入业务 | Redis 故障时降级查库窗口去重，绝不直通 |
+| G3 | 升级任务执行前必须重读事故状态 | 终态任务直接终结，禁止对已关闭事故发通知 |
+| G4 | 状态页已发布公告不可变（immutable），更正只追加 | 防止口径篡改，满足合规审计 |
+| G5 | 交接唯一索引不可绕过（禁用 `INSERT IGNORE` 静默吞错） | 冲突必须显式返回 ONC-409-03 |
+| G6 | 换班审批双确认（发起人 + 接班人）缺一不可进入审批态 1 | 防止单方恶意换班 |
+| G7 | 终态写入与定时器清理同事务（或最终一致对账兜底） | 孤儿任务每日对账自动终结 |
+| G8 | 对外公开接口（状态页）字段白名单出参 | 严禁泄漏内部服务名/拓扑/数值指标 |
+
+### 16.5 验收核对清单（AC）
+
+| # | 验收项 | 通过标准 |
+| --- | --- | --- |
+| AC01 | 认领幂等 | 并发 50 次 ack 仅 1 条 ack_record，其余返回当前认领人 |
+| AC02 | 指纹去重 | 同一告警 5min 内重放 100 次，事故数=1，`dedup_count=100` |
+| AC03 | 状态机拦截 | 对已 RESOLVED 事故执行 mitigate，返回 ONC-409-01 且时间线无变化 |
+| AC04 | 交接幂等 | 同班次重复提交返回既有记录 + `duplicated=true`，DB 仅 1 行 |
+| AC05 | 公告不可变 | 尝试修改已发布公告被拒，更正走追加且时间线可见 |
+| AC06 | 死人开关 | 杀掉调度服务双实例后 2min 内备用路由直拨预置号码组 |
+| AC07 | 孤儿任务对账 | 构造 10 条孤儿 escalation_task，日对账全部自动终结 |
+| AC08 | 公开接口脱敏 | 状态页响应扫不出内部服务名/IP/端口语义字段 |
+
+---
+
+*本文档为《生产事故应急响应与 OnCall 值班调度体系》详细设计 v1.1（补全烂尾入库版）。烂尾点位：§16.2 单行之表补齐七类竞态、§16.3 交接唯一索引落库（16.1 #9 引用闭环）、§16.4 守卫 G1-G8、§16.5 验收 AC01-AC08；并修正 §16.1/§5.3 错误码口径（47152/47162 → ONC-409-01/ONC-409-03 符号码，与正文错误码表一致）。*
