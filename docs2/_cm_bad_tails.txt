@@ -1,16 +1,4 @@
-﻿==== 服务端通用数据导入服务与批量操作引擎-详细设计.md | 929 lines | unclosed: ```@L779 ====
-                        error_code="FIELD_REQUIRED", field_name=f,
-                        field_value=None, error_message=message
-                    ))
-
-        # unique 和 relation_exists 在 BatchProcessor 中做批量校验（需查库）
-        return errors
-
-
-class BatchValidator:
-    """批次级批量校验（需
-
-==== 客户端安全防护体系-详细设计.md | 936 lines | unclosed: ```@L829 ====
+﻿==== 客户端安全防护体系-详细设计.md | 936 lines | unclosed: ```@L829 ====
     // ── 调试器检测 ──
 
     private fun detectDebugger(): Boolean {
