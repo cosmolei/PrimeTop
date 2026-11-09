@@ -1,26 +1,3 @@
-                json.dumps(event.get('metadata', {}))
-            ])
-        self.clickhouse.execute(
-            "INSERT INTO video_behavior_event VALUES",
-            rows
-        )
-
-    def _finalize_session(self, state: WatchSessionState,
-                          abandoned: bool = False, abandon_point: int = 0,
-                          abandon_reason: str = ''):
-
-==== 客户端-理科解题页面架构与交互设计.md | 946 lines | unclosed: ```@L703 ====
-                  const SizedBox(height: 16),
-                  // 公式渲染
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child
-
 ==== 服务端-学习计划模板库与场景化计划方案智能推荐引擎-详细设计.md | 963 lines | unclosed: ```@L910 ====
                 // 生成正常学习日任务
                 DailyTaskPlan dailyPlan = buildDailyPlan(
