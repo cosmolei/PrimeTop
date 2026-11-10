@@ -1,15 +1,3 @@
-==== 客户端-统一图片加载缓存框架与智能预加载引擎-详细设计.md | 1040 lines | unclosed: ```@L1000 ====
-  /// [url] 图片 URL
-  /// [transform] 期望的变换参数（会被自适应引擎调整）
-  /// [module] 业务模块标识
-  Future<ImageLoadResult> load({
-    required String url,
-    ImageTransform transform = ImageTransform.standard,
-    required String module,
-  }) async {
-    final stopwatch = Stopwatch()..start();
-
-
 ==== 服务端-学生AI辅助依赖度智能监测与自主学习能力培养引导引擎-详细设计.md | 1061 lines | unclosed: ```@L1002 ====
                     "rewardMultiplier": 2.0
                 }
