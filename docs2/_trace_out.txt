@@ -1,0 +1,52 @@
+OPEN@2 [```] info=[] stack=1
+OPEN@6 [```] info=[json] stack=2
+CLOSE@41 (opened@6)
+CLOSE@45 (opened@2)
+OPEN@47 [```] info=[] stack=1
+OPEN@51 [```] info=[json] stack=2
+CLOSE@58 (opened@51)
+OPEN@62 [```] info=[json] stack=2
+CLOSE@74 (opened@62)
+CLOSE@78 (opened@47)
+OPEN@80 [```] info=[] stack=1
+OPEN@84 [```] info=[json] stack=2
+CLOSE@115 (opened@84)
+CLOSE@123 (opened@80)
+OPEN@172 [```] info=[] stack=1
+CLOSE@178 (opened@172)
+OPEN@188 [```] info=[] stack=1
+CLOSE@205 (opened@188)
+OPEN@240 [```] info=[] stack=1
+OPEN@262 [```] info=[typescript] stack=2
+CLOSE@340 (opened@262)
+CLOSE@348 (opened@240)
+OPEN@396 [```] info=[] stack=1
+OPEN@400 [```] info=[python] stack=2
+CLOSE@467 (opened@400)
+OPEN@475 [```] info=[typescript] stack=2
+CLOSE@539 (opened@475)
+OPEN@543 [```] info=[typescript] stack=2
+CLOSE@589 (opened@543)
+OPEN@612 [```] info=[java] stack=2
+CLOSE@648 (opened@612)
+OPEN@656 [```] info=[sql] stack=2
+CLOSE@677 (opened@656)
+OPEN@689 [```] info=[java] stack=2
+CLOSE@701 (opened@689)
+OPEN@705 [```] info=[java] stack=2
+CLOSE@731 (opened@705)
+OPEN@741 [```] info=[java] stack=2
+CLOSE@769 (opened@741)
+OPEN@785 [```] info=[yaml] stack=2
+CLOSE@794 (opened@785)
+CLOSE@802 (opened@396)
+OPEN@827 [```] info=[] stack=1
+OPEN@831 [```] info=[java] stack=2
+CLOSE@872 (opened@831)
+OPEN@880 [```] info=[yaml] stack=2
+CLOSE@908 (opened@880)
+OPEN@916 [```] info=[typescript] stack=2
+CLOSE@966 (opened@916)
+OPEN@970 [```] info=[sql] stack=2
+CLOSE@1004 (opened@970)
+FINAL STACK: [{"len":3,"lineNo":827,"ch":"`"}]
