@@ -1,15 +1,3 @@
-==== 服务端-学生学习卡点智能诊断与突破辅导策略推荐引擎-详细设计.md | 1449 lines | unclosed: ```@L1135 ====
-                s.setPriority(s.getPriority() + 15);
-            }
-            
-            // 高自信学生：可以更直接指出错误
-            if (profile.getSubjectConfidence(s.getSubject()) > 0.7 &&
-                s.getStrategyType() == BreakthroughStrategyType.COGNITIVE_CONFLICT) {
-                s.setPriority(s.getPriority() + 10);
-            }
-            
-            // 低自
-
 ==== 服务端分布式锁实现与并发资源竞争防护规范-详细设计.md | 1449 lines | unclosed: ```@L1400 ====
 
 ## 附录 B：异常码定义
