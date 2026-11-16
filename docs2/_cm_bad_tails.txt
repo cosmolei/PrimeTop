@@ -1,15 +1,3 @@
-==== 客户端-统一对话框与模态弹出层调度管理系统-详细设计.md | 1356 lines | unclosed: ```@L1336 ====
-      title: '启硕 PrimeTop',
-      theme: AppTheme.lightTheme,
-      darkTheme: AppTheme.darkTheme,
-      home: const SplashPage(),
-      builder: (context, child) {
-        // 初始化 OverlayManager
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          ref.read(overlayManagerProvider);
-        });
-        return child ??
-
 ==== 服务端-教育AI代码执行沙箱与智能计算辅助引擎-详细设计.md | 1433 lines | unclosed: ```@L1408 ====
         // 密钥/Token
         Pattern.compile("(?i)(?:key|token|secret|password|api[_-]?key)\\s*[=:]\\s*\\S+"),
