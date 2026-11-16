@@ -1,0 +1,10 @@
+const fs = require('fs');
+const path = process.argv[2];
+const s = fs.readFileSync(path, 'utf8');
+const lines = s.split('\n');
+let n = 0;
+lines.forEach(l => { if (l.trim().startsWith('```')) n++; });
+console.log('fences:', n, n % 2 === 0 ? 'BALANCED' : 'UNBALANCED');
+console.log('BOM:', s.charCodeAt(0) === 0xFEFF ? 'YES' : 'NO');
+console.log('TODO:', /TODO/.test(s));
+console.log('lines:', lines.length);
