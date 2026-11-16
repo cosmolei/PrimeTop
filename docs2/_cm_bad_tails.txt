@@ -1,143 +1,57 @@
-==== 服务端分布式锁实现与并发资源竞争防护规范-详细设计.md | 1449 lines | unclosed: ```@L1400 ====
+==== 数据迁移与Schema版本管理-详细设计.md | 1535 lines | unclosed: \@L1508 ====
 
-## 附录 B：异常码定义
 
-| 异常码 | 含义 | HTTP 状态码 | 处理建议 |
-|-------|------|------------|----------|
-| `LOCK_001` | 锁获取超时 | 409 | 提示用户稍后重试 |
-| `LOCK_002` | 锁获取被中断 | 500 | 记录日志，检查线程池状态 |
-| `LOCK_003` | 锁内业务执行失败 | 500 | 记录日志，检查业务异常原因 |
-| `LOCK_004` | 锁已过期（被 Redis 淘汰） | 500 | 检查业务是否需要补偿 |
-| `LOCK_005` | 降级锁降级到本地锁 | 200 | 检查 Redis 可用性 |
+---
 
-==== 服务端-教育内容知识切片与微课智能分段生成引擎-详细设计.md | 1508 lines | unclosed: ```@L1481 ====
-    PRACTICE,     // 练习
-    SUMMARY,      // 总结回顾
-    EXTENSION     // 拓展延伸
-}
+## 12. 迁移版本登记表
 
-// 内容类型
-public enum RawContentType {
-    TEXT,         // 纯文本/Markdown
-    PDF,          // PDF文档
-    VIDEO,        // 视频内容}
+| 版本 | 描述 | 日期 | 作者 | 影响范围 |
+|------|------|------|------|----------|
+| 001 | 初始化 Schema | - | - | 全部表 |
+| 002 | 用户微信字段 | - | - | users |
+| 003 | ... | | | |
 
-==== 服务端-学生课外阅读分级推荐与阅读素养发展追踪评估引擎-详细设计.md | 1518 lines | unclosed: ```@L1503 ====
+==== 服务端-学生学习过程质量实时感知与低效学习行为智能干预引擎-详细设计.md | 1664 lines | unclosed: \@L1661 ====
+
+新用户
+    │
+    ├─ 观察
+
+==== 服务端-学生课外阅读分级推荐与阅读素养发展追踪评估引擎-详细设计.md | 1518 lines | unclosed: \@L1503 ====
+
+@Service
+public class ReadingQuizGenerator {
+    
+    /**
+     * 为书籍生成阅读理解测试题
      */
     public List<ReadingQuiz> generateForBook(BookInfo book, int questionCount) {
         List<ReadingQuiz> quizzes = new ArrayList<>();
         
         // 获取书籍关键章节内容
-        List<BookChapter> keyChapters = chapterService.getKeyChapters(book.getId());
-        
-        for (BookChapter chapter : keyChapters) {
-            String prompt = String.format(
-                """
 
-==== 服务端-学生假期作业智能拆解与个性化每日执行计划自动编排引擎-详细设计.md | 1656 lines | unclosed: ```@L1372 ====
-- 《防沉迷与未成年人保护机制-详细设计》（时段红线与日限额交集，C1/C2/R10）
-- 《服务端-家长端学情报告聚合与通知服务-详细设计》（家长周报聚合，R11）
-- 《服务端-学习打卡记录与成就解锁计算引擎-详细设计》与《服务端-积分获取规则计算与虚拟资产交易结算服务-详细设计》（完结联动，R12）
-- 《学习提醒与智能通知调度系统-详细设计》（今日任务提醒触达，R13）
-- 《多模型调度与成本治理-详细设计》（daily_tip LLM 网关，R14）
+==== 服务端-教育内容知识切片与微课智能分段生成引擎-详细设计.md | 1508 lines | unclosed: \@L1481 ====
 
-## 18. 维护记录
+// 切片任务状态
+public enum SliceTaskStatus {
+    PENDING,      // 待处理
+    PROCESSING,   // 处理中
+    SLICED,       // 切片完成待审核
+    REVIEWING,    // 审核中
+    PUBLISHED,    // 已发布
+    REJECTED,     // 已驳回
+    FAILED,       // 处理失败
+    TIMEOUT       // 超时
 
-- **v1.0（初稿）**：写到 §4.2 拆解响应 JSON `"title": "暑假作业本 P1-P5 整数运算（上` 字符串中途截断（507 行，围栏 29 奇），§4.2 后内容缺失。
-- **v1.1（2026-08-20 补全）**：补齐 §4.2 响应（itemId 正负语义/warnings/异步拆解与幂等说明）；新增 §4.3-§4.11（排程查询/今日视图/多视角进度/手动调整四原子操作/生…
+==== 服务端-教育平台搜索智能联想与实时热搜推荐引擎-详细设计.md | 1716 lines | unclosed: \@L1155 ====
 
-==== 服务端-学生学习过程质量实时感知与低效学习行为智能干预引擎-详细设计.md | 1664 lines | unclosed: ```@L1661 ====
-│ EVALUATED│ (效果已评估)
-└──────────┘
-```
-
-### 10.2 行为模式标签流转
-
-```
-新用户
-    │
-    ├─ 观察
-
-==== 服务端-AI教育回答教材版本方法一致性校验与术语自适应修正引擎-详细设计.md | 1701 lines | unclosed: ```@L1687 ====
-| --- | --- | --- |
-| alignment.pass_threshold | 70 | 通过校验的最低分数 |
-| alignment.auto_correct.confidence_min | 0.7 | 自动修正的最低置信度 |
-| alignment.check.timeout_ms | 500 | 单次校验最大耗时 |
-| alignment.parallel.pool_size | 4 | 并行检测器线程池大小 |
-| alignment.cache.rule_ttl_seconds | 1800 | 规则缓存TTL |
-| alignment.cache.request_ttl_seconds | 3600 | 请求缓存TTL |
-| alignment.batch.max_size | 20 | 批量校验最大数量 |
-| alignment.monitor.alert.deviation_rate | 0.3 | 偏差率告警阈值 |
-
-
-==== 服务端-反爬虫与内容数据防泄漏防护引擎-详细设计.md | 1703 lines | unclosed: ```@L1559 ====
-
-## 14. 演进规划
-
-| 阶段 | 目标 | 核心能力 |
-| --- | --- | --- |
-| **V1.0** | 基础防护 | 签名验证 + 频率检测 + IP 限流 |
-| **V1.5** | 行为分析 | 用户行为序列分析 + 风险评分 + 静默降级 |
-| **V2.0** | 智能防护 | ML 模型推理 + 动态规则 + 滑块验证码 |
-| **V2.5** | 溯源追责 | 隐性水印体系 + 泄漏检测 + 自动取证 |
-| **V3.0** | 对抗升级 | 验证码多样性（行为式/推理式）+ 实时对抗模型 |
-
-==== 服务端-学生跨学科错题关联分析与共享认知薄弱点诊断引擎-详细设计.md | 1708 lines | unclosed: ```@L1176,```@L1199 ====
-| 文档 | 关系 |
-| --- | --- |
-| 错题服务-详细设计 | 数据上游，提供错题记录 |
-| 答题记录服务-详细设计 | 数据上游，提供答题数据 |
-| 学情分析-详细设计 | 数据下游，消费跨学科分析结果 |
-| 学生学习画像与能力维度模型 | 共享认知能力维度体系 |
-| 题目知识点自动标注与课标对齐引擎 | 标注协作，题目元数据共享 |
-| 知识追踪模型引擎 | 掌握度计算算法参考 |
-| 练习答题实时批改与知识点掌握度增量更新服务 | 掌握度更新链路参考 |
-
-
-==== 服务端-教育平台搜索智能联想与实时热搜推荐引擎-详细设计.md | 1716 lines | unclosed: ```@L1155 ====
-
-## 15. 版本演进路线
-
-| 版本 | 功能范围 | 预估时间 |
-|------|---------|---------|
-| v1.0 (MVP) | 基础联想（Trie 前缀匹配）+ 全局热搜 Top-10 + 搜索历史 | 2 周 |
-| v1.5 | 拼音匹配 + 分学段/学科热搜 + 个性化推荐（基础版） | 2 周 |
-| v2.0 | 语义向量召回 + 协同过滤推荐 + 搜索趋势分析看板 | 3 周 |
-| v2.5 | 搜索词智能扩展 + 关联词图谱 + 考试季节性加权 | 2 周 |
-| v3.0 | AI 驱动的搜索意图预判 + 多模态搜索联想 | 待定 |
-
-==== 服务端-练习答题实时自适应难度调节与动态选题引擎-详细设计.md | 1784 lines | unclosed: ```@L1358 ====
-        // 0.5 ~ 0.7 → D3
-        // 0.7 ~ 0.85 → D3（不在初始就给太难）
-        // > 0.85 → D4
-        if (mastery < 0.3) return DifficultyTier.D1_BASIC;
-        if (mastery < 0.5) return DifficultyTier.D2_ELEMENTARY;
-        if (mastery < 0.85) return DifficultyTier.D3_INTERMEDIATE;
-        return DifficultyTier.D4_ADVANCED;
-    }
-}
-```
-
-==== 客户端全局异常处理与安全恢复机制-详细设计.md | 1856 lines | unclosed: ```@L1793,```@L1856 ====
-    final msg = ErrorMessageFactory.create(
-      ExceptionType.network,
-      Severity.high,
-      AgeGroup.preschool,
-    );
-    expect(msg, contains('网络'));
-    expect(msg, isNot(contains('HTTP'))); // 不含技术术语
-  });
-}
-```}
-
-==== 服务端-学生作业AI生成内容检测与AI辅助学习比例分析引擎-详细设计.md | 1880 lines | unclosed: ```@L1793 ====
-  retry_max: 3
-  
-  # 可见性
-  default_student_visible: false
-  default_parent_visible: true
-  default_teacher_visible: true
-  
-  # 水印池
-  watermark_pool_refresh_interval: 3600  # 秒
-```
+客户端搜索行为
+       │
+       ▼
+┌──────────────┐
+│  API 网关     │
+│  (参数校验)   │
+└──────┬───────┘
+       │
+       ├──── 异步 ────┐
+       │               │
