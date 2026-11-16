@@ -1,17 +1,4 @@
-==== 服务端-学生课外阅读分级推荐与阅读素养发展追踪评估引擎-详细设计.md | 1518 lines | unclosed: \@L1503 ====
-
-@Service
-public class ReadingQuizGenerator {
-    
-    /**
-     * 为书籍生成阅读理解测试题
-     */
-    public List<ReadingQuiz> generateForBook(BookInfo book, int questionCount) {
-        List<ReadingQuiz> quizzes = new ArrayList<>();
-        
-        // 获取书籍关键章节内容
-
-==== 服务端-教育内容知识切片与微课智能分段生成引擎-详细设计.md | 1508 lines | unclosed: \@L1481 ====
+﻿==== 服务端-教育内容知识切片与微课智能分段生成引擎-详细设计.md | 1508 lines | unclosed: \@L1481 ====
 
 // 切片任务状态
 public enum SliceTaskStatus {
