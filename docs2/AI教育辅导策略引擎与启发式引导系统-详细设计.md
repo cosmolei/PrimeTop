@@ -824,7 +824,7 @@ def classify_frustration(score: float) -> FrustrationLevel:
         return FrustrationLevel.HIGH
     else:
         return FrustrationLevel.CRITICAL
-
+```
 
 ### 5.3 干预执行器与防重复规则
 
@@ -1445,4 +1445,4 @@ DEFAULT_DECISION（按学段）：K/G1_G3 → SCAFFOLD + L0 + encouraging；G4_G
 | 版本 | 日期 | 说明 |
 |------|------|------|
 | v1.0 | 2026-08 初批次 | 初始版本：概念模型/决策引擎三层/学科策略/挫败评估。文件在 §5.2 干预矩阵代码中段截断，API/数据模型/状态机/错误码/降级/监控/合规/验收全缺 |
-| v1.1 | 2026-08-18 | 补全烂尾文档：完成 §5.2 干预矩阵（HIGH 补全 + CRITICAL 新增）并新增 §5.3 干预执行器与防重复规则、§6 执行追踪与效果反馈闭环（六类 outcome/效果分/权重自优化护栏/多样性硬约束）、§7 数据模型六表 DDL 与 Redis 九类 Key、§8 API（decide 幂等/feedback/state/gRPC×3/管理端×7）、§9 四套状态机与守卫 G1-G12、§10 幂等并发六机制、§11 错误码 56400-56499 共 21 项、§12 降级矩阵 D1-D10（旁路降级不阻断 AI 主链路）、§13 监控 10 指标+4 埋点、§14 容量估算（DAU50 万/日 300 万决策/PSE 无状态水平扩展）、§15 合规红线 C1-C8、§16 契约对齐 12 项、§17 验收 18 条。修复 v1.0 四处缺陷：SOVRATIC 拼写×2（§3.2.2/§4.1，应为 SOCRATIC）、TeachingStrategy 枚举缺 CONTEXT_MAP/MNEMONIC 定义（§4.3 英语词汇序列引用未定义枚举）、STRATEGY_WEIGHTS 学段键粒度与 AGE_STRATEGY_CONSTRAINTS 不一致（G1_G6 vs G1_G3/G4_G6，运行期 KeyError） |
+| v1.1 | 2026-08-18 | 补全烂尾文档：完成 §5.2 干预矩阵（HIGH 补全 + CRITICAL 新增）并新增 §5.3 干预执行器与防重复规则、§6 执行追踪与效果反馈闭环（六类 outcome/效果分/权重自优化护栏/多样性硬约束）、§7 数据模型六表 DDL 与 Redis 九类 Key、§8 API（decide 幂等/feedback/state/gRPC×3/管理端×7）、§9 四套状态机与守卫 G1-G12、§10 幂等并发六机制、§11 错误码 56400-56499 共 21 项、§12 降级矩阵 D1-D10（旁路降级不阻断 AI 主链路）、§13 监控 10 指标+4 埋点、§14 容量估算（DAU50 万/日 300 万决策/PSE 无状态水平扩展）、§15 合规红线 C1-C8、§16 契约对齐 12 项、§17 验收 18 条。修复 v1.0 四处缺陷：SOVRATIC 拼写×2（§3.2.2/§4.1，应为 SOCRATIC）、TeachingStrategy 枚举缺 CONTEXT_MAP/MNEMONIC 定义（§4.3 英语词汇序列引用未定义枚举）、STRATEGY_WEIGHTS 学段键粒度与 AGE_STRATEGY_CONSTRAINTS 不一致（G1_G6 vs G1_G3/G4_G6，运行期 KeyError）；v1.2 修复 §5.2 代码块未闭合缺陷（classify_frustration 后补闭合围栏，§5.3 标题与代码块恢复正渲染） |
