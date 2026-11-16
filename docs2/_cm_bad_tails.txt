@@ -1,15 +1,3 @@
-==== 服务端-教育AI代码执行沙箱与智能计算辅助引擎-详细设计.md | 1433 lines | unclosed: ```@L1408 ====
-        // 密钥/Token
-        Pattern.compile("(?i)(?:key|token|secret|password|api[_-]?key)\\s*[=:]\\s*\\S+"),
-        // 文件系统路径（可能的敏感路径）
-        Pattern.compile("/(?:etc|root|home|var|proc|sys)/[^\\s]+")
-    );
-
-    /**
-     * 过滤输出中的敏感信息
-     */
-    public static String filterOutput}
-
 ==== AI教育辅导策略引擎与启发式引导系统-详细设计.md | 1448 lines | unclosed: ```@L1280 ====
 18. 账户注销 → 30 天内决策/结果/干预日志全部清除，管理端查询不可见。
 
