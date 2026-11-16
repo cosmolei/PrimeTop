@@ -1,15 +1,3 @@
-==== 服务端-学习计划执行障碍智能诊断与个性化克服策略推荐引擎-详细设计.md | 1139 lines | unclosed: ```@L1137 ====
-                tasks=micro_tasks,
-                pause_original=payload.get("pauseOriginalPlan", True)
-            )
-```
-
-### 6.2 启发式分析器
-
-```python
-class HeuristicAnalyzer:
-    """启发式模式分析器 - 识
-
 ==== 客户端-统一对话框与模态弹出层调度管理系统-详细设计.md | 1356 lines | unclosed: ```@L1336 ====
       title: '启硕 PrimeTop',
       theme: AppTheme.lightTheme,
