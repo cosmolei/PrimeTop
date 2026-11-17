@@ -1,21 +1,25 @@
 const fs = require('fs');
-const lines = fs.readFileSync(process.argv[2], 'utf8').split(/\r?\n/);
-const stack = [];
-for (let i = 0; i < lines.length; i++) {
-  const m = lines[i].match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
-  if (!m) continue;
-  const fence = m[1], info = m[2].trim(), len = fence.length, ch = fence[0];
-  if (stack.length && stack[stack.length-1].ch === ch && info === '' && len >= stack[stack.length-1].len) {
-    const top = stack.pop();
-    console.log('CLOSE@' + (i+1) + ' (opened@' + top.lineNo + ')');
-  } else if (!info || /^\{|\=|^\S/.test(info) === true) {
-    if (!(stack.length && stack[stack.length-1].ch === ch && info === '')) {
-      stack.push({ len, lineNo: i+1, ch });
-      console.log('OPEN@' + (i+1) + ' [' + fence + '] info=[' + info.slice(0,30) + '] stack=' + stack.length);
+for (const f of process.argv.slice(2)) {
+  const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/);
+  let inBlock = false, openLine = -1, openLen = 0, ch = '';
+  const openRe = /^\s{0,3}(`{3,}|~{3,})/;
+  console.log('########## ' + f.split(/[\\/]/).pop());
+  lines.forEach((l, i) => {
+    const m = l.match(openRe);
+    if (m) {
+      const fence = m[1];
+      if (!inBlock) {
+        inBlock = true; openLine = i + 1; openLen = fence.length; ch = fence[0];
+        // suspicious open: previous non-blank line is prose (not heading/list/blank)?
+        let j = i - 1; while (j >= 0 && lines[j].trim() === '') j--;
+        const prev = j >= 0 ? lines[j].trim() : '';
+        const prevIsProse = prev !== '' && !prev.match(/^#{1,6}\s/) && !prev.match(/^[-*+]\s/) && !prev.match(/^\d+\.\s/) && !prev.match(/^\|/) && !prev.match(/^[:>]/);
+        if (prevIsProse) console.log('  ?OPEN@L' + (i + 1) + ' after prose: "' + prev.substring(0, 60) + '"');
+      } else if (fence[0] === ch && fence.length >= openLen) {
+        inBlock = false;
+      }
+    } else if (inBlock && /^\s{0,3}#{1,6}\s/.test(l)) {
+      console.log('  !!HEADING INSIDE BLOCK@L' + (i + 1) + ' (block opened @L' + openLine + '): ' + l.trim().substring(0, 60));
     }
-  } else {
-    stack.push({ len, lineNo: i+1, ch });
-    console.log('OPEN2@' + (i+1) + ' [' + fence + '] stack=' + stack.length);
-  }
+  });
 }
-console.log('FINAL STACK:', JSON.stringify(stack));
