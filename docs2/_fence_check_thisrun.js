@@ -1,19 +1,23 @@
 const fs = require('fs');
-const files = process.argv.slice(2);
-for (const f of files) {
-  const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/);
-  let inBlock = false, openLine = -1, openLen = 0, ch = '';
-  const openRe = /^\s{0,3}(`{3,}|~{3,})/;
-  lines.forEach((l, i) => {
-    const m = l.match(openRe);
-    if (m) {
-      const fence = m[1];
-      if (!inBlock) {
-        inBlock = true; openLine = i + 1; openLen = fence.length; ch = fence[0];
-      } else if (fence[0] === ch && fence.length >= openLen) {
-        inBlock = false;
-      }
-    }
-  });
-  console.log(f.split(/[\\/]/).pop(), '=>', inBlock ? ('UNCLOSED fence opened @L' + openLine + ' totalLines=' + lines.length) : 'BALANCED');
+const f = process.argv[2];
+const lines = fs.readFileSync(f, 'utf8').replace(/\r\n/g, '\n').split('\n');
+let inFence = false, fenceChar = '', fenceLen = 0, openLine = 0;
+let bad = [];
+for (let i = 0; i < lines.length; i++) {
+  const line = lines[i];
+  if (!inFence) {
+    const m = line.match(/^ {0,3}(`{3,}|~{3,})/);
+    if (m) { inFence = true; fenceChar = m[1][0]; fenceLen = m[1].length; openLine = i + 1; }
+  } else {
+    const re = new RegExp('^ {0,3}' + (fenceChar === '`' ? '`' : '~') + '{' + fenceLen + ',}\\s*$');
+    if (re.test(line)) { inFence = false; }
+  }
+}
+if (inFence) {
+  console.log('UNCLOSED: opened at line ' + openLine + ' (' + fenceChar.repeat(fenceLen) + ')');
+  for (let i = Math.max(0, openLine - 3); i < Math.min(lines.length, openLine + 8); i++) {
+    console.log((i + 1) + ': ' + lines[i]);
+  }
+} else {
+  console.log('BALANCED');
 }
